@@ -1,5 +1,9 @@
 # 🛡️ TorShield — System-Wide Tor VPN Client
 
+<p align="center">
+  <img src="torshield.png" alt="TorShield Logo" width="180"/>
+</p>
+
 A GUI-based Tor VPN client for Linux that routes **all system traffic** through
 the Tor network — every app, every browser, every connection — with a single
 toggle switch. No per-app configuration required.
@@ -51,6 +55,10 @@ chmod +x install.sh
 ```
 
 > Do **not** run the installer with `sudo`. It will prompt for your password when needed.
+
+The installer also copies `torshield.png` to `~/.local/share/icons/` so the app
+icon appears in the application menu and desktop shortcut. Make sure
+`torshield.png` is in the same directory as `install.sh` before running.
 
 After installation, launch TorShield from:
 - **Terminal:** `torshield`
@@ -214,6 +222,7 @@ torshield/
 ├── requirements.txt     # Python dependencies
 ├── install.sh           # One-shot installer (recommended)
 ├── uninstall.sh         # Uninstaller
+├── torshield.png        # App icon — copied to ~/.local/share/icons/ by installer
 ├── tor_vpn_gui.spec     # PyInstaller build spec
 ├── dist/tor_vpn_gui     # Prebuilt standalone binary
 ├── INSTALL.md           # Detailed manual installation guide
