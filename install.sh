@@ -158,6 +158,15 @@ else
     error "tor_vpn_gui.py not found! Make sure you run install.sh from inside the downloaded folder."
 fi
 
+if [ -f "torshield.png" ]; then
+    cp "torshield.png" "$INSTALL_DIR/"
+    mkdir -p "$HOME/.local/share/icons"
+    cp "torshield.png" "$HOME/.local/share/icons/torshield.png"
+    ok "torshield.png copied to $INSTALL_DIR/ and ~/.local/share/icons/"
+else
+    warn "torshield.png not found — skipping icon copy"
+fi
+
 # ── Step 6 — Launcher script ──────────────────────────────────────────────────
 header "Step 6 — Creating launcher"
 
@@ -198,7 +207,7 @@ cat > "$DESKTOP_FILE" << DESKTOP
 Name=TorShield
 Comment=System-Wide Tor VPN Client
 Exec=$LAUNCHER
-Icon=network-vpn
+Icon=torshield
 Terminal=false
 Type=Application
 Categories=Network;Security;
