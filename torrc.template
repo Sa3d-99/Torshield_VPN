@@ -1,0 +1,40 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# TorShield — torrc template
+# Copy this file to /etc/tor/torrc and edit as needed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# SOCKS5 proxy port — used by the connection test inside TorShield
+SocksPort 9050
+
+# Control port — used by stem to manage circuits and send NEWNYM signals
+ControlPort 9051
+
+# Transparent proxy port — used for system-wide iptables traffic routing
+TransPort 9040
+
+# DNS port — resolves hostnames through Tor to prevent DNS leaks
+DNSPort 5353
+AutomapHostsOnResolve 1
+
+# ── Bridges (required in censored networks such as Egypt) ────────────────────
+# Uncomment and fill in your own bridges from https://bridges.torproject.org
+# Select "obfs4" or "snowflake" depending on what works in your region.
+#
+# Snowflake example (recommended for heavily censored networks):
+#
+# UseBridges 1
+# ClientTransportPlugin snowflake exec /usr/bin/snowflake-client \
+#     -log /home/YOUR_USERNAME/snowflake.log \
+#     -url https://snowflake-broker.torproject.net/ \
+#     -front foursquare.com \
+#     -ice stun:stun.l.google.com:19302,stun:stun.antisip.com:3478
+# Bridge snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72 \
+#     fingerprint=2B280B23E1107BB62ABFC40DDCC8824814F80A72 \
+#     url=https://snowflake-broker.torproject.net/ \
+#     front=foursquare.com
+#
+# obfs4 example:
+#
+# UseBridges 1
+# ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy
+# Bridge obfs4 <IP>:<PORT> <FINGERPRINT> cert=<CERT> iat-mode=0

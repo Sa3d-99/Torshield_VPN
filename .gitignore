@@ -1,0 +1,51 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+*.spec
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── PyInstaller build output ──────────────────────────────────────────────────
+# The compiled binary is intentionally excluded — users build it themselves
+# using the instructions in INSTALL.md
+dist/
+build/
+*.spec
+
+# ── IDE / Editor ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS artefacts ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Tor runtime files (never commit these) ───────────────────────────────────
+*.log
+snowflake.log
+cached-certs
+cached-microdesc*
+lock
+state
+tor.pid
+
+# ── Sensitive / local config ──────────────────────────────────────────────────
+# Do NOT commit torrc — it may contain bridge credentials
+# Users create their own from the template in docs/
+torrc
+torrc.local
