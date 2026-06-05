@@ -6,3 +6,4 @@ stem>=1.8.1
 requests>=2.31.0
 PySocks>=1.7.1        # SOCKS5 support for requests
 fake-useragent>=1.4.0 # Optional — User-Agent randomisation
+Pillow>=10.0.0        # Logo image display in the header

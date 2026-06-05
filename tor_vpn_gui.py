@@ -69,6 +69,12 @@ try:
 except ImportError:
     _UA_AVAILABLE = False
 
+try:
+    from PIL import Image
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Suppress stdout/stderr if not already set (e.g. when run with sudo)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -483,6 +489,14 @@ class TorShieldApp(ctk.CTk):
         self._system_routing_active = False
         self._after_id: Optional[str] = None
 
+        # Load logo image for the header
+        self._logo_image = None
+        if _PIL_AVAILABLE:
+            _logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Header_Logo.png")
+            if os.path.isfile(_logo_path):
+                _pil_img = Image.open(_logo_path).resize((36, 36), Image.LANCZOS)
+                self._logo_image = ctk.CTkImage(light_image=_pil_img, dark_image=_pil_img, size=(36, 36))
+
         self._build_ui()
 
         # Warn if not running as root
@@ -513,7 +527,10 @@ class TorShieldApp(ctk.CTk):
         header.pack_propagate(False)
 
         ctk.CTkLabel(
-            header, text="🛡  TorShield",
+            header,
+            text="  TorShield" if self._logo_image else "🛡  TorShield",
+            image=self._logo_image,
+            compound="left",
             font=ctk.CTkFont(family="Consolas", size=22, weight="bold"),
             text_color=THEME["accent"],
         ).pack(side="left", padx=24)
