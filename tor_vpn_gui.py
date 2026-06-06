@@ -8,9 +8,7 @@ Dependencies:
     pip install customtkinter stem requests fake-useragent
 
 Setup:
-    1. Set TOR_EXE_PATH and TORRC_PATH below
-    2. Run with sudo (required for iptables):
-         sudo python3 tor_vpn_gui.py
+    Run install.sh once, then type: torshield
 
 torrc minimum requirements:
     SocksPort 9050
@@ -18,6 +16,8 @@ torrc minimum requirements:
     TransPort 9040
     DNSPort 5353
     AutomapHostsOnResolve 1
+    CookieAuthentication 1
+    CookieAuthFileGroupReadable 1
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -25,11 +25,11 @@ torrc minimum requirements:
 # ─────────────────────────────────────────────────────────────────────────────
 TOR_EXE_PATH     = "/usr/sbin/tor"
 TORRC_PATH       = "/etc/tor/torrc"
-CONTROL_PASSWORD = ""
+CONTROL_PASSWORD = ""          # Leave empty — cookie auth is used automatically
 
-SOCKS_PORT  = 9050
-TRANS_PORT  = 9040   # TransPort — used for system-wide iptables routing
-DNS_PORT    = 5353   # DNSPort   — Tor handles DNS to prevent leaks
+SOCKS_PORT   = 9050
+TRANS_PORT   = 9040            # TransPort — used for system-wide iptables routing
+DNS_PORT     = 5353            # DNSPort   — Tor handles DNS to prevent leaks
 CONTROL_PORT = 9051
 CONTROL_HOST = "127.0.0.1"
 
@@ -76,44 +76,41 @@ except ImportError:
     _PIL_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Suppress stdout/stderr if not already set (e.g. when run with sudo)
+# Suppress stdout/stderr if not set (e.g. when run with pkexec/sudo)
 # ─────────────────────────────────────────────────────────────────────────────
-
 if sys.stdout is None:
-    sys.stdout = open(os.devnull, 'w')
+    sys.stdout = open(os.devnull, "w")
 if sys.stderr is None:
-    sys.stderr = open(os.devnull, 'w')
+    sys.stderr = open(os.devnull, "w")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Root check and elevation
+# Root check and elevation via pkexec
 # ─────────────────────────────────────────────────────────────────────────────
-def ensure_root():
-    if os.geteuid() != 0:
-        # 1. Preserve necessary environment variables for GUI display when elevating
-        display = os.environ.get('DISPLAY', ':0')
-        xauth = os.environ.get('XAUTHORITY', '')
-        wayland = os.environ.get('WAYLAND_DISPLAY', '')
+def ensure_root() -> None:
+    if os.geteuid() == 0:
+        return   # already root — nothing to do
 
-        # 2.form the pkexec command with the necessary environment variables
-        cmd = ['pkexec', 'env', f'DISPLAY={display}']
-        if xauth:
-            cmd.append(f'XAUTHORITY={xauth}')
-        if wayland:
-            cmd.append(f'WAYLAND_DISPLAY={wayland}')
-        
-        # 3. append the current Python executable and script arguments
-        cmd.append(sys.executable)
-        cmd.extend(sys.argv[1:])
-        
-        try:
-            subprocess.check_call(cmd)
-        except subprocess.CalledProcessError:
-            print("Failed to elevate privileges. Please run with sudo or ensure pkexec is configured correctly.")
-        sys.exit()
+    display = os.environ.get("DISPLAY", ":0")
+    xauth   = os.environ.get("XAUTHORITY", "")
+    wayland = os.environ.get("WAYLAND_DISPLAY", "")
 
-# call this at the very start to re-launch with root if not already
+    cmd = ["pkexec", "env", f"DISPLAY={display}"]
+    if xauth:
+        cmd.append(f"XAUTHORITY={xauth}")
+    if wayland:
+        cmd.append(f"WAYLAND_DISPLAY={wayland}")
+    cmd += [sys.executable] + sys.argv[1:]
+
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError:
+        print("Privilege elevation failed. Run with sudo or configure pkexec.")
+    sys.exit()
+
+
 ensure_root()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Country codes
@@ -161,6 +158,7 @@ THEME = {
     "disconnected": "#FF3860",
 }
 
+
 def ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
@@ -170,9 +168,9 @@ def ts() -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _run(cmd: list[str]) -> bool:
-    """Run a shell command, return True on success."""
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
+        subprocess.run(cmd, check=True,
+                       stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL)
         return True
     except subprocess.CalledProcessError:
@@ -182,87 +180,50 @@ def _run(cmd: list[str]) -> bool:
 def enable_system_routing() -> tuple[bool, str]:
     """
     Redirect ALL system TCP traffic and DNS through Tor using iptables.
-    This affects every app on the machine — Chrome, curl, Discord, etc.
-
-    Requires root (sudo). Called automatically when Connect is clicked.
-
-    How it works:
-      1. Old connections are flushed via conntrack to prevent leaks from
-         existing sessions that were established before Tor was active.
-      2. QUIC (UDP 443/80) is blocked — Chrome uses QUIC by default which
-         bypasses TCP and cannot be tunnelled through Tor, so we reject it
-         to force fallback to normal HTTPS TCP which Tor can handle.
-      3. DNS queries (UDP port 53) → Tor's DNSPort (5353) so hostnames
-         are resolved anonymously through Tor, preventing DNS leaks.
-      4. All TCP connections → Tor's TransPort (9040) transparent proxy,
-         which forwards them through the Tor circuit.
-      5. Tor's own traffic is exempted so it can reach the network.
-      6. Loopback (127.x.x.x) is exempted so local services still work.
+    Affects every app — Chrome, curl, Discord, etc.
     """
     try:
-        # Flush all existing tracked connections so any pre-Tor sessions
-        # cannot continue leaking real IP traffic after routing is enabled.
-        # Wrapped in try/except — conntrack may not be installed on all systems.
+        # Flush conntrack so pre-Tor sessions cannot leak the real IP
         try:
-            subprocess.run(
-                ["conntrack", "-F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
+            subprocess.run(["conntrack", "-F"],
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
         except Exception:
-            pass  # conntrack not installed — safe to ignore
+            pass   # conntrack not installed — safe to ignore
 
-        # Get the UID that the tor process runs as
-        result = subprocess.run(
-            ["id", "-u", "debian-tor"],
-            capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            tor_uid = result.stdout.strip()
-        else:
-            # Fall back: find UID from running tor process
-            ps = subprocess.run(
-                ["pgrep", "-u", "debian-tor", "tor"],
-                capture_output=True, text=True
-            )
-            # If running as root (our case), skip uid exemption
-            tor_uid = None
+        # Get debian-tor UID to exempt Tor's own process from redirection
+        result = subprocess.run(["id", "-u", "debian-tor"],
+                                capture_output=True, text=True)
+        tor_uid = result.stdout.strip() if result.returncode == 0 else None
 
-        # Flush existing rules first for a clean slate
+        # Clean slate
         _run(["iptables", "-F", "OUTPUT"])
         _run(["iptables", "-t", "nat", "-F", "OUTPUT"])
 
-        # Allow loopback traffic (127.x.x.x) — local services must work
+        # Allow loopback — local services must keep working
         _run(["iptables", "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"])
-        _run(["iptables", "-t", "nat", "-A", "OUTPUT",
-              "-o", "lo", "-j", "RETURN"])
+        _run(["iptables", "-t", "nat", "-A", "OUTPUT", "-o", "lo", "-j", "RETURN"])
 
-        # Exempt Tor's own process from redirection (prevent routing loop)
+        # Exempt Tor's own process (prevents routing loop)
         if tor_uid:
             _run(["iptables", "-t", "nat", "-A", "OUTPUT",
                   "-m", "owner", "--uid-owner", tor_uid, "-j", "RETURN"])
             _run(["iptables", "-A", "OUTPUT",
                   "-m", "owner", "--uid-owner", tor_uid, "-j", "ACCEPT"])
 
-        # Redirect DNS (UDP port 53) → Tor DNSPort to prevent DNS leaks
+        # DNS → Tor DNSPort (prevents DNS leaks)
         _run(["iptables", "-t", "nat", "-A", "OUTPUT",
               "-p", "udp", "--dport", "53",
               "-j", "REDIRECT", "--to-ports", str(DNS_PORT)])
 
-        # Redirect all TCP traffic → Tor TransPort (transparent proxy)
+        # TCP → Tor TransPort (transparent proxy)
         _run(["iptables", "-t", "nat", "-A", "OUTPUT",
               "-p", "tcp", "--syn",
               "-j", "REDIRECT", "--to-ports", str(TRANS_PORT)])
 
-        # Block QUIC (UDP on ports 443 and 80).
-        # QUIC is a UDP-based protocol used by Chrome/HTTP3 that bypasses
-        # TCP and cannot be routed through Tor's transparent proxy.
-        # Rejecting it forces browsers to fall back to TCP HTTPS, which
-        # Tor can handle correctly — preventing silent UDP leaks.
-        _run(["iptables", "-A", "OUTPUT",
-              "-p", "udp", "--dport", "443", "-j", "REJECT"])
-        _run(["iptables", "-A", "OUTPUT",
-              "-p", "udp", "--dport", "80",  "-j", "REJECT"])
+        # Block QUIC (UDP 443/80) — forces Chrome/Firefox to fall back to TCP
+        _run(["iptables", "-A", "OUTPUT", "-p", "udp", "--dport", "443", "-j", "REJECT"])
+        _run(["iptables", "-A", "OUTPUT", "-p", "udp", "--dport", "80",  "-j", "REJECT"])
 
         return True, "System-wide routing enabled — all traffic through Tor"
 
@@ -271,22 +232,10 @@ def enable_system_routing() -> tuple[bool, str]:
 
 
 def disable_system_routing() -> tuple[bool, str]:
-    """
-    Remove iptables rules and restore normal direct internet routing.
-    Called automatically when Disconnect is clicked.
-
-    Explicitly deletes the QUIC REJECT rules with -D before flushing,
-    ensuring they are cleanly removed even if the flush order matters.
-    """
+    """Remove iptables rules and restore normal direct internet routing."""
     try:
-        # Explicitly delete the QUIC block rules added during enable.
-        # Using -D (delete) targets these specific rules precisely.
-        _run(["iptables", "-D", "OUTPUT",
-              "-p", "udp", "--dport", "443", "-j", "REJECT"])
-        _run(["iptables", "-D", "OUTPUT",
-              "-p", "udp", "--dport", "80",  "-j", "REJECT"])
-
-        # Flush remaining OUTPUT and NAT rules to restore normal routing
+        _run(["iptables", "-D", "OUTPUT", "-p", "udp", "--dport", "443", "-j", "REJECT"])
+        _run(["iptables", "-D", "OUTPUT", "-p", "udp", "--dport", "80",  "-j", "REJECT"])
         _run(["iptables", "-F", "OUTPUT"])
         _run(["iptables", "-t", "nat", "-F", "OUTPUT"])
         return True, "System routing restored — traffic is direct again"
@@ -295,8 +244,19 @@ def disable_system_routing() -> tuple[bool, str]:
 
 
 def check_root() -> bool:
-    """Return True if running as root (required for iptables)."""
     return os.geteuid() == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cookie file locations
+# Ubuntu 22.04 + Tor 0.4.7+  →  /run/tor/control.authcookie
+# Older Debian/Ubuntu         →  /var/lib/tor/control_auth_cookie
+# ─────────────────────────────────────────────────────────────────────────────
+_COOKIE_PATHS = [
+    "/run/tor/control.authcookie",           # Ubuntu 22.04 + Tor 0.4.7+
+    "/var/lib/tor/control_auth_cookie",      # Older Debian/Ubuntu
+    "/var/run/tor/control.authcookie",       # Some Debian variants
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -304,26 +264,81 @@ def check_root() -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TorManager:
+
     def __init__(self) -> None:
-        self._process:    Optional[subprocess.Popen] = None
-        self._controller: Optional[Controller]       = None
-        self._monitoring  = False
+        self._process:      Optional[subprocess.Popen] = None
+        self._controller:   Optional[Controller]       = None
+        self._monitoring    = False
+        self._user_data_dir: Optional[str]             = None
+
+    # ── Start Tor ─────────────────────────────────────────────────────────────
 
     def start_tor(self) -> bool:
+        """
+        Launch the Tor binary.
+
+        FIX 1 — DataDirectory:
+          /var/lib/tor is owned by debian-tor. If the current process
+          cannot write there, Tor exits immediately with a permissions
+          error. We detect this and use a user-owned fallback directory
+          ~/.local/share/torshield/tor-data so Tor can always start.
+
+        FIX 2 — stderr no longer swallowed:
+          Original code used stderr=DEVNULL which hid all startup errors.
+          Now we capture stderr via PIPE. If Tor exits within 3 seconds
+          we raise RuntimeError with the actual Tor output so the error
+          appears in the GUI log instead of silently disappearing.
+        """
         if not os.path.isfile(TOR_EXE_PATH):
             raise FileNotFoundError(
-                f"tor not found at:\n{TOR_EXE_PATH}\n\nEdit TOR_EXE_PATH."
+                f"Tor binary not found: {TOR_EXE_PATH}\n"
+                "Run: sudo apt-get install tor"
             )
         if not os.path.isfile(TORRC_PATH):
             raise FileNotFoundError(
-                f"torrc not found at:\n{TORRC_PATH}\n\nEdit TORRC_PATH."
+                f"torrc not found: {TORRC_PATH}\n"
+                "Run install.sh to set it up."
             )
+
+        # ── DataDirectory: use fallback if /var/lib/tor is not writable ──────
+        extra_args: list[str] = []
+        if not os.access("/var/lib/tor", os.W_OK):
+            self._user_data_dir = os.path.expanduser(
+                "~/.local/share/torshield/tor-data"
+            )
+            os.makedirs(self._user_data_dir, mode=0o700, exist_ok=True)
+            extra_args = ["--DataDirectory", self._user_data_dir]
+
+        # ── Launch Tor — stderr captured to PIPE, not swallowed ───────────────
+        cmd = [TOR_EXE_PATH, "-f", TORRC_PATH] + extra_args
         self._process = subprocess.Popen(
-            [TOR_EXE_PATH, "-f", TORRC_PATH],
+            cmd,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
+
+        # If Tor exits within 3 s it hit a fatal error — surface the message
+        try:
+            self._process.wait(timeout=3)
+            stderr_out = ""
+            if self._process.stderr:
+                stderr_out = self._process.stderr.read().decode(
+                    "utf-8", errors="replace"
+                )
+            raise RuntimeError(
+                "Tor exited immediately after launch.\n\n"
+                "Common causes:\n"
+                "  • /etc/tor/torrc has a syntax error\n"
+                "  • DataDirectory not writable\n"
+                "  • Port 9050/9051/9040 already in use\n\n"
+                f"Tor output:\n{stderr_out[-800:] if stderr_out else '(none)'}"
+            )
+        except subprocess.TimeoutExpired:
+            pass   # still running after 3 s — good
+
         return True
+
+    # ── Stop Tor ──────────────────────────────────────────────────────────────
 
     def stop_tor(self) -> None:
         self._monitoring = False
@@ -339,25 +354,106 @@ class TorManager:
     def is_running(self) -> bool:
         return self._process is not None and self._process.poll() is None
 
+    # ── Connect controller ────────────────────────────────────────────────────
+
     def connect_controller(self, max_retries: int = 30,
-                           delay: float = 2.0) -> None:
+                            delay: float = 2.0) -> None:
+        """
+        Connect to Tor ControlPort with automatic cookie authentication.
+
+        FIX 3 — Cookie authentication:
+          Original code called ctrl.authenticate() with no arguments.
+          That only works when CookieAuthentication is OFF (insecure).
+          Now we try three methods in order:
+            1. Explicit password (if CONTROL_PASSWORD is set)
+            2. Read cookie file directly from all known paths
+               — handles both /run/tor (Ubuntu 22.04) and
+                 /var/lib/tor (older installs)
+            3. stem auto-detect as last resort
+
+        FIX 4 — Ubuntu 22.04 cookie path:
+          Ubuntu 22.04 + Tor 0.4.7+ writes the cookie to:
+            /run/tor/control.authcookie
+          Older installs write to:
+            /var/lib/tor/control_auth_cookie
+          We check all known paths so it works on both.
+        """
+        # Include user-owned DataDirectory fallback if we created one
+        cookie_paths = list(_COOKIE_PATHS)
+        if self._user_data_dir:
+            cookie_paths.insert(
+                0, os.path.join(self._user_data_dir, "control_auth_cookie")
+            )
+
+        last_error: Exception = ConnectionError("No attempt made yet")
+
         for attempt in range(max_retries):
             try:
                 ctrl = Controller.from_port(
                     address=CONTROL_HOST, port=CONTROL_PORT
                 )
-                if CONTROL_PASSWORD:
-                    ctrl.authenticate(password=CONTROL_PASSWORD)
-                else:
+                authenticated = False
+
+                # Method 1: explicit password
+                if CONTROL_PASSWORD and not authenticated:
+                    try:
+                        ctrl.authenticate(password=CONTROL_PASSWORD)
+                        authenticated = True
+                    except Exception:
+                        pass
+
+                # Method 2: read cookie file directly
+                if not authenticated:
+                    for cookie_path in cookie_paths:
+                        if os.path.isfile(cookie_path):
+                            try:
+                                with open(cookie_path, "rb") as f:
+                                    cookie_bytes = f.read()
+                                ctrl.authenticate(cookie_bytes)
+                                authenticated = True
+                                break
+                            except Exception:
+                                continue
+
+                # Method 3: stem auto-detect
+                if not authenticated:
                     ctrl.authenticate()
+                    authenticated = True
+
                 self._controller = ctrl
                 return
-            except Exception:
+
+            except Exception as exc:
+                last_error = exc
                 if attempt < max_retries - 1:
                     time.sleep(delay)
+
+        # Build a helpful error with clear fix instructions
+        found = [p for p in cookie_paths if os.path.isfile(p)]
+        if not found:
+            hint = (
+                "\n\nNo cookie file found. Fix:\n"
+                "  sudo sh -c 'echo \"CookieAuthentication 1\" >> /etc/tor/torrc'\n"
+                "  sudo sh -c 'echo \"CookieAuthFileGroupReadable 1\" >> /etc/tor/torrc'\n"
+                "  sudo systemctl restart tor\n"
+                "  sudo usermod -a -G debian-tor $USER\n"
+                "  newgrp debian-tor    (or log out and back in)"
+            )
+        else:
+            hint = (
+                f"\n\nCookie found at: {found[0]}\n"
+                "But read failed. Check your user is in debian-tor group:\n"
+                "  groups $USER   ← must include: debian-tor\n"
+                "  sudo usermod -a -G debian-tor $USER\n"
+                "  newgrp debian-tor"
+            )
+
         raise ConnectionError(
-            f"Could not connect to ControlPort {CONTROL_HOST}:{CONTROL_PORT}."
+            f"Could not connect to ControlPort {CONTROL_HOST}:{CONTROL_PORT}\n"
+            f"Last error: {last_error}{hint}"
         )
+
+    # ── Internal ──────────────────────────────────────────────────────────────
 
     def _disconnect_controller(self) -> None:
         if self._controller:
@@ -489,38 +585,48 @@ class TorShieldApp(ctk.CTk):
         self._system_routing_active = False
         self._after_id: Optional[str] = None
 
-        # Load logo image for the header
         self._logo_image = None
         if _PIL_AVAILABLE:
-            _logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Header_Logo.png")
+            _logo_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "Header_Logo.png"
+            )
             if os.path.isfile(_logo_path):
                 _pil_img = Image.open(_logo_path).resize((36, 36), Image.LANCZOS)
-                self._logo_image = ctk.CTkImage(light_image=_pil_img, dark_image=_pil_img, size=(36, 36))
+                self._logo_image = ctk.CTkImage(
+                    light_image=_pil_img, dark_image=_pil_img, size=(36, 36)
+                )
 
         self._build_ui()
 
-        # Warn if not running as root
         if not check_root():
             self._log(
-                "⚠  Not running as root — system-wide routing will be "
-                "disabled. Run with: sudo python3 tor_vpn_gui.py",
+                "⚠  Not running as root — system-wide routing disabled. "
+                "Launch via the torshield command (uses pkexec automatically).",
                 "warn"
             )
         else:
             self._log("Running as root — system-wide routing available.", "ok")
 
         self._log(f"Tor binary : {TOR_EXE_PATH}")
-        self._log(f"torrc path : {TORRC_PATH}")
+        self._log(f"torrc      : {TORRC_PATH}")
 
         if not os.path.isfile(TOR_EXE_PATH):
             self._log(f"tor not found at {TOR_EXE_PATH}", "error")
+
+        found = [p for p in _COOKIE_PATHS if os.path.isfile(p)]
+        if found:
+            self._log(f"Cookie file: {found[0]}", "ok")
+        else:
+            self._log(
+                "Cookie file not found yet — will appear after Tor starts "
+                "(or run: sudo systemctl start tor)", "warn"
+            )
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
-        # Header
         header = ctk.CTkFrame(self, fg_color=THEME["panel"],
                                corner_radius=0, height=64)
         header.pack(fill="x", pady=(0, 2))
@@ -548,7 +654,6 @@ class TorShieldApp(ctk.CTk):
         )
         self._status_badge.pack(side="right", padx=24)
 
-        # Routing indicator badge
         self._routing_badge = ctk.CTkLabel(
             header, text="",
             font=ctk.CTkFont(family="Consolas", size=10),
@@ -556,7 +661,6 @@ class TorShieldApp(ctk.CTk):
         )
         self._routing_badge.pack(side="right", padx=8)
 
-        # Body
         body = ctk.CTkFrame(self, fg_color=THEME["bg"])
         body.pack(fill="both", expand=True, padx=16, pady=(0, 16))
         body.columnconfigure(0, weight=0, minsize=300)
@@ -587,7 +691,6 @@ class TorShieldApp(ctk.CTk):
                      fg_color=THEME["border"]).pack(fill="x", padx=14, pady=5)
 
     def _build_left(self, parent) -> None:
-        # ── Connect / Disconnect ──────────────────────────────────────────────
         self._section(parent, "Connection")
 
         row = ctk.CTkFrame(parent, fg_color="transparent")
@@ -611,11 +714,9 @@ class TorShieldApp(ctk.CTk):
         )
         self._disconnect_btn.grid(row=0, column=1, padx=(4, 0), sticky="ew")
 
-        # ── System-wide routing toggle ────────────────────────────────────────
         self._divider(parent)
         self._section(parent, "System-Wide Traffic Routing")
 
-        # Info box
         info = ctk.CTkFrame(parent, fg_color=THEME["card"], corner_radius=8)
         info.pack(fill="x", padx=14, pady=(0, 6))
         ctk.CTkLabel(
@@ -646,12 +747,11 @@ class TorShieldApp(ctk.CTk):
         if not check_root():
             ctk.CTkLabel(
                 parent,
-                text="⚠  Requires: sudo python3 tor_vpn_gui.py",
+                text="⚠  Requires root (pkexec/sudo)",
                 font=ctk.CTkFont(family="Consolas", size=9),
                 text_color=THEME["warning"],
             ).pack(anchor="w", padx=18, pady=(0, 4))
 
-        # ── Country selector ──────────────────────────────────────────────────
         self._divider(parent)
         self._section(parent, "Exit Node Country")
 
@@ -671,7 +771,6 @@ class TorShieldApp(ctk.CTk):
         )
         self._country_menu.pack(fill="x", padx=14, pady=(0, 4))
 
-        # ── New Identity ──────────────────────────────────────────────────────
         self._divider(parent)
         self._section(parent, "Identity")
 
@@ -684,7 +783,6 @@ class TorShieldApp(ctk.CTk):
         )
         self._newid_btn.pack(fill="x", padx=14, pady=(0, 4))
 
-        # ── Test button ───────────────────────────────────────────────────────
         self._divider(parent)
         self._section(parent, "Connection Test")
 
@@ -697,14 +795,11 @@ class TorShieldApp(ctk.CTk):
         )
         self._test_btn.pack(fill="x", padx=14, pady=(0, 4))
 
-        # ── IP display ────────────────────────────────────────────────────────
         self._divider(parent)
         self._section(parent, "Public IP via Tor")
 
-        ip_frame = ctk.CTkFrame(parent, fg_color=THEME["card"],
-                                corner_radius=8)
+        ip_frame = ctk.CTkFrame(parent, fg_color=THEME["card"], corner_radius=8)
         ip_frame.pack(fill="x", padx=14, pady=(0, 6))
-
         self._ip_label = ctk.CTkLabel(
             ip_frame, text="—",
             font=ctk.CTkFont(family="Consolas", size=20, weight="bold"),
@@ -712,7 +807,6 @@ class TorShieldApp(ctk.CTk):
         )
         self._ip_label.pack(padx=12, pady=10)
 
-        # ── Uptime ────────────────────────────────────────────────────────────
         self._divider(parent)
         self._uptime_label = ctk.CTkLabel(
             parent, text="Uptime: —",
@@ -723,7 +817,6 @@ class TorShieldApp(ctk.CTk):
         self._connect_time: Optional[float] = None
 
     def _build_right(self, parent) -> None:
-        # Circuit tracker
         hdr = ctk.CTkFrame(parent, fg_color="transparent")
         hdr.pack(fill="x", padx=14, pady=(14, 2))
 
@@ -853,8 +946,7 @@ class TorShieldApp(ctk.CTk):
                     "end", "  No built circuits detected yet…\n")
             else:
                 for circ in circuits:
-                    self._circuit_box.insert(
-                        "end", f"  Circuit #{circ['id']}\n")
+                    self._circuit_box.insert("end", f"  Circuit #{circ['id']}\n")
                     labels = ["Entry Guard  ", "Middle Relay ", "Exit Node    "]
                     icons  = ["🟢", "🟡", "🔴"]
                     for idx, (fp, nick, ip) in enumerate(circ["path"]):
@@ -885,30 +977,28 @@ class TorShieldApp(ctk.CTk):
                 country_code = COUNTRY_CODES.get(self._country_var.get(), "")
                 if country_code:
                     self._tor.set_exit_node(country_code)
-                    self._log(
-                        f"Exit node set to: {self._country_var.get()}", "ok")
+                    self._log(f"Exit node set to: {self._country_var.get()}", "ok")
 
                 self._tor.start_circuit_monitoring(
                     callback=self._update_circuit_display, interval=5.0)
 
                 self.after(0, lambda: self._set_status("connected"))
                 self._log(
-                    "Connected! Tor is running. Enable the routing switch "
-                    "to route ALL system traffic through Tor.", "ok")
+                    "Connected! Enable the routing switch to route "
+                    "ALL system traffic through Tor.", "ok")
 
             except FileNotFoundError as exc:
                 self.after(0, lambda: self._set_status("disconnected"))
                 self._log(str(exc), "error")
-                self.after(0, lambda: messagebox.showerror(
-                    "File Not Found", str(exc)))
+                self.after(0, lambda: messagebox.showerror("File Not Found", str(exc)))
             except Exception as exc:
                 self.after(0, lambda: self._set_status("disconnected"))
                 self._log(f"Error: {exc}", "error")
+                self.after(0, lambda: messagebox.showerror("Connection Error", str(exc)))
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_disconnect(self) -> None:
-        # Always disable system routing before stopping Tor
         if self._system_routing_active:
             self._log("Disabling system-wide routing…")
             ok, msg = disable_system_routing()
@@ -929,15 +1019,8 @@ class TorShieldApp(ctk.CTk):
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_routing_toggle(self) -> None:
-        """
-        Toggle system-wide iptables routing on/off.
-        When ON  → ALL traffic from every app goes through Tor.
-        When OFF → traffic returns to normal direct routing.
-        """
         if self._routing_switch.get():
-            # Switch turned ON
             self._log("Enabling system-wide traffic routing via iptables…")
-
             def _enable():
                 ok, msg = enable_system_routing()
                 self._system_routing_active = ok
@@ -952,18 +1035,14 @@ class TorShieldApp(ctk.CTk):
                         "Open any browser — it will show the Tor IP.", "ok")
                 else:
                     self.after(0, lambda: self._routing_switch.deselect())
-
             threading.Thread(target=_enable, daemon=True).start()
         else:
-            # Switch turned OFF
             self._log("Disabling system-wide routing…")
-
             def _disable():
                 ok, msg = disable_system_routing()
                 self._system_routing_active = False
                 self._log(msg, "ok" if ok else "error")
                 self.after(0, lambda: self._routing_badge.configure(text=""))
-
             threading.Thread(target=_disable, daemon=True).start()
 
     def _on_country_change(self, selection: str) -> None:
@@ -971,7 +1050,6 @@ class TorShieldApp(ctk.CTk):
         if self._status != "connected":
             self._log(f"Exit node queued: {selection}")
             return
-
         def _worker():
             try:
                 self._tor.set_exit_node(country_code)
@@ -983,7 +1061,6 @@ class TorShieldApp(ctk.CTk):
                 self._log("New circuit requested.", "info")
             except Exception as exc:
                 self._log(f"Failed to change exit node: {exc}", "error")
-
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_new_identity(self) -> None:
@@ -1002,7 +1079,6 @@ class TorShieldApp(ctk.CTk):
         self._log("Testing connection through Tor SOCKS5 proxy…")
         self._ip_label.configure(text="…", text_color=THEME["warning"])
         self._test_btn.configure(state="disabled")
-
         def _worker():
             try:
                 ip = get_tor_public_ip()
@@ -1017,7 +1093,6 @@ class TorShieldApp(ctk.CTk):
                 self._log(f"Connection test failed: {exc}", "error")
             finally:
                 self.after(0, lambda: self._test_btn.configure(state="normal"))
-
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_close(self) -> None:
