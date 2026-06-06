@@ -187,8 +187,8 @@ fi
 # ── Step 6 — Python packages ──────────────────────────────────────────────────
 header "Step 6 — Python packages"
 
-pip install --quiet --upgrade pip
-pip install --quiet customtkinter stem requests PySocks fake-useragent pillow
+pip install --quiet --upgrade pip --break-system-packages
+pip install --quiet customtkinter stem requests PySocks fake-useragent pillow --break-system-packages
 ok "Python packages installed"
 
 # ── Step 7 — Copy TorShield files ────────────────────────────────────────────
