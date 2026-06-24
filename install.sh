@@ -61,16 +61,55 @@ TORRC_TEMPLATE="$SCRIPT_DIR/torrc.template"
 LAUNCHER="$INSTALL_DIR/launch.sh"
 CONF_FILE="$INSTALL_DIR/torshield.conf"
 
+# ── Step 0 — Detect OS / distribution ─────────────────────────────────────────
+header "Step 0 — Detecting your system"
+
+DISTRO_ID="unknown"; DISTRO_LIKE=""; DISTRO_NAME="unknown"
+if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    DISTRO_ID="${ID:-unknown}"
+    DISTRO_LIKE="${ID_LIKE:-}"
+    DISTRO_NAME="${PRETTY_NAME:-$DISTRO_ID}"
+fi
+ok "Detected: $DISTRO_NAME"
+info "OS=$(uname -s)  ·  kernel=$(uname -r)  ·  arch=$(uname -m)"
+
+# This installer is Debian-family only (uses apt, debian-tor group, etc.).
+if ! command -v apt-get >/dev/null 2>&1; then
+    error "TorShield's installer supports Debian-family distros only\n(Ubuntu, Debian, Kali, Linux Mint, Pop!_OS, Parrot, …).\nDetected '$DISTRO_NAME' has no apt-get. Aborting."
+fi
+
+# Decide how to satisfy PyQt5.QtX11Extras (the one package that differs by distro):
+#   • Ubuntu / Mint / Pop!_OS / Debian stable → apt has python3-pyqt5.qtx11extras
+#   • Kali / Parrot / Debian testing-sid (rolling) → that apt package is absent,
+#     so we use the self-contained PyQt5 pip wheel instead.
+case " $DISTRO_ID $DISTRO_LIKE " in
+    *" kali "*|*" parrot "*)
+        QT_STRATEGY="pip"
+        info "Rolling Debian derivative → will use the PyQt5 pip wheel for QtX11Extras." ;;
+    *" ubuntu "*|*" linuxmint "*|*" pop "*|*" debian "*)
+        QT_STRATEGY="apt"
+        info "Standard Debian/Ubuntu family → will use apt for Qt packages." ;;
+    *)
+        QT_STRATEGY="auto"
+        info "Unrecognised Debian derivative → will auto-detect the Qt method." ;;
+esac
+
 # ── Step 1 — System packages ──────────────────────────────────────────────────
 header "Step 1 — System packages"
 
 info "Updating package lists…"
 sudo apt-get update -qq || warn "apt-get update reported a problem — continuing."
 
-# The GUI uses PyQt5 + PyQt-Fluent-Widgets. On Linux, qfluentwidgets also needs
-# python3-pyqt5.qtx11extras (QX11Info) or it fails to import. tor runs the daemon;
-# conntrack flushes leaks. Pluggable transports are best-effort + detected later.
-CORE_PACKAGES=(tor conntrack python3 python3-pip python3-pyqt5 python3-pyqt5.qtx11extras)
+# tor runs the daemon; conntrack flushes leaks; python3-pyqt5 is the GUI toolkit.
+# python3-pyqt5.qtx11extras is OPTIONAL here on purpose: it exists on Ubuntu but
+# NOT on Kali/Debian-rolling. qfluentwidgets needs PyQt5.QtX11Extras, but the pip
+# PyQt5 wheel bundles it, so we fall back to pip (handled in Step 1b) instead of
+# aborting the whole install when that apt package is missing.
+# QtX11Extras is handled per-distro in Step 1b (not here), so it isn't in the
+# blanket list — that avoids a noisy "package not found" on Kali.
+CORE_PACKAGES=(tor conntrack python3 python3-pip python3-pyqt5)
 OPTIONAL_PACKAGES=(obfs4proxy snowflake-client fonts-noto-color-emoji)
 
 for pkg in "${CORE_PACKAGES[@]}"; do
@@ -87,14 +126,52 @@ for pkg in "${OPTIONAL_PACKAGES[@]}"; do
     if dpkg -s "$pkg" &>/dev/null; then
         ok "$pkg — already installed"
     else
-        info "Installing $pkg (optional bridge transport)…"
+        info "Installing $pkg (optional)…"
         if sudo apt-get install -y -qq "$pkg"; then
             ok "$pkg — installed"
         else
-            warn "$pkg not available from apt — TorShield will work without it."
+            warn "$pkg not available from apt — handled another way / skipped."
         fi
     fi
 done
+
+# ── Step 1b — Guarantee PyQt5.QtX11Extras (cross-distro) ──────────────────────
+header "Step 1b — Qt X11Extras (Fluent UI requirement)"
+
+# Detect a pip flag once (newer pip on Debian needs --break-system-packages).
+PIP_BSP=()
+if pip install --help 2>/dev/null | grep -q -- "--break-system-packages"; then
+    PIP_BSP=(--break-system-packages)
+fi
+
+if python3 -c "import PyQt5.QtX11Extras" 2>/dev/null; then
+    # Already present (e.g. Ubuntu with apt qtx11extras) — change NOTHING.
+    ok "PyQt5.QtX11Extras available (system PyQt5 — untouched)"
+else
+    # For apt/auto distros, try the apt package first (Ubuntu/Mint/Pop/Debian).
+    if [ "$QT_STRATEGY" != "pip" ]; then
+        info "Trying apt python3-pyqt5.qtx11extras ($DISTRO_ID)…"
+        if sudo apt-get install -y -qq python3-pyqt5.qtx11extras 2>/dev/null; then
+            ok "Installed python3-pyqt5.qtx11extras via apt"
+        else
+            warn "apt package unavailable on $DISTRO_ID — will use pip wheel."
+        fi
+    fi
+    # Still missing (Kali/Parrot/rolling, or apt didn't have it) → pip wheel into
+    # ~/.local. --user keeps it isolated (never overwrites system PyQt5);
+    # --ignore-installed forces it even if pip thinks PyQt5 is already present.
+    if ! python3 -c "import PyQt5.QtX11Extras" 2>/dev/null; then
+        info "Installing self-contained PyQt5 wheel to ~/.local (bundles QtX11Extras)…"
+        pip install --user --ignore-installed --quiet "${PIP_BSP[@]}" \
+            PyQt5 PyQt5-Qt5 PyQt5-sip 2>&1 | tail -2 || true
+    fi
+    if python3 -c "import PyQt5.QtX11Extras" 2>/dev/null; then
+        ok "PyQt5.QtX11Extras now available"
+    else
+        warn "Still missing PyQt5.QtX11Extras — the Fluent UI may not start."
+        warn "Try manually:  pip install --user PyQt5 ${PIP_BSP[*]}"
+    fi
+fi
 
 # ── Step 2 — Detect Tor + transport binaries ─────────────────────────────────
 header "Step 2 — Detecting binaries on this machine"
