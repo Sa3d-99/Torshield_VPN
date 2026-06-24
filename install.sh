@@ -67,11 +67,11 @@ header "Step 1 — System packages"
 info "Updating package lists…"
 sudo apt-get update -qq || warn "apt-get update reported a problem — continuing."
 
-# python3-tk is required for the GUI; tor for the daemon; conntrack for leak
-# flushing. The pluggable transports may not exist in every repo, so they are
-# installed best-effort and detected afterwards.
-CORE_PACKAGES=(tor conntrack python3 python3-pip python3-tk)
-OPTIONAL_PACKAGES=(obfs4proxy snowflake-client)
+# The GUI uses PyQt5 + PyQt-Fluent-Widgets. On Linux, qfluentwidgets also needs
+# python3-pyqt5.qtx11extras (QX11Info) or it fails to import. tor runs the daemon;
+# conntrack flushes leaks. Pluggable transports are best-effort + detected later.
+CORE_PACKAGES=(tor conntrack python3 python3-pip python3-pyqt5 python3-pyqt5.qtx11extras)
+OPTIONAL_PACKAGES=(obfs4proxy snowflake-client fonts-noto-color-emoji)
 
 for pkg in "${CORE_PACKAGES[@]}"; do
     if dpkg -s "$pkg" &>/dev/null; then
@@ -254,6 +254,16 @@ else
     error "tor_vpn_gui.py not found! Run install.sh from inside the project folder."
 fi
 
+# The GUI imports torshield_core (backend engine) and reads VERSION for updates.
+for extra in torshield_core.py VERSION; do
+    if [ -f "$extra" ]; then
+        cp "$extra" "$INSTALL_DIR/"
+        ok "$extra copied"
+    else
+        warn "$extra not found — the app may not start without it."
+    fi
+done
+
 # Persist the detected paths so the GUI uses the exact same binaries we set up.
 cat > "$CONF_FILE" << CONF
 # TorShield — machine configuration written by install.sh
@@ -265,15 +275,58 @@ OBFS4PROXY=$OBFS4PROXY
 CONF
 ok "Saved machine config → $CONF_FILE"
 
-# Copy logos if present
+# Copy logos into the app dir as-is (used by the in-app header).
 for img in Header_Logo.png torshield.png; do
     if [ -f "$img" ]; then
         cp "$img" "$INSTALL_DIR/"
-        mkdir -p "$HOME/.local/share/icons"
-        cp "$img" "$HOME/.local/share/icons/$img"
         ok "$img copied"
     fi
 done
+
+# Generate a SQUARE app/launcher icon so the taskbar does not stretch a wide
+# logo into a square slot. We pad the source to a square canvas (keeping aspect
+# ratio) and install it into the hicolor theme at several sizes, plus the
+# legacy ~/.local/share/icons/torshield.png the desktop file references.
+ICON_SRC=""
+for cand in Header_Logo.png torshield.png; do
+    [ -f "$cand" ] && { ICON_SRC="$cand"; break; }
+done
+
+if [ -n "$ICON_SRC" ]; then
+    if python3 - "$ICON_SRC" "$HOME" <<'PYICON'
+import sys, os
+try:
+    from PIL import Image
+except Exception:
+    sys.exit(1)
+src, home = sys.argv[1], sys.argv[2]
+img = Image.open(src).convert("RGBA")
+w, h = img.size
+if w != h:                       # pad short side → square (no distortion)
+    side = max(w, h)
+    canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    canvas.paste(img, ((side - w) // 2, (side - h) // 2), img)
+    img = canvas
+# Legacy path referenced by torshield.desktop (Icon=torshield)
+legacy = os.path.join(home, ".local/share/icons")
+os.makedirs(legacy, exist_ok=True)
+img.resize((256, 256), Image.LANCZOS).save(os.path.join(legacy, "torshield.png"))
+# Proper hicolor theme sizes for crisp rendering everywhere
+for s in (16, 24, 32, 48, 64, 128, 256):
+    d = os.path.join(home, f".local/share/icons/hicolor/{s}x{s}/apps")
+    os.makedirs(d, exist_ok=True)
+    img.resize((s, s), Image.LANCZOS).save(os.path.join(d, "torshield.png"))
+print("ok")
+PYICON
+    then
+        ok "Square app icon generated (taskbar/launcher, no stretching)"
+        gtk-update-icon-cache -q -t -f "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+    else
+        warn "Could not generate square icon (Pillow?) — copying source as-is."
+        mkdir -p "$HOME/.local/share/icons"
+        cp "$ICON_SRC" "$HOME/.local/share/icons/torshield.png"
+    fi
+fi
 
 # ── Step 8b — Fetch bridges automatically from Tor ────────────────────────────
 header "Step 8b — Fetching bridges from Tor"

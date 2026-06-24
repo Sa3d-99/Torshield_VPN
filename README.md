@@ -79,7 +79,7 @@ torshield-uninstall
 
 ```bash
 sudo apt update
-sudo apt install tor obfs4proxy snowflake-client conntrack python3-pip python3-tk -y
+sudo apt install tor obfs4proxy snowflake-client conntrack python3-pip python3-pyqt5 python3-pyqt5.qtx11extras -y
 ```
 
 ### 2 — Disable the system Tor service
@@ -129,8 +129,7 @@ CookieAuthFileGroupReadable 1
 
 ```bash
 pip install -r requirements.txt
-# or
-pip install customtkinter stem requests PySocks fake-useragent
+# installs PyQt5, PyQt-Fluent-Widgets, stem, requests, PySocks, fake-useragent, Pillow
 ```
 
 ### 5 — Run TorShield
@@ -150,15 +149,18 @@ sudo python3 tor_vpn_gui.py
 
 ## Usage
 
-1. **Click ▶ Connect** — TorShield starts the Tor daemon in the background
-2. **Wait** for circuits to appear in the right panel (~30–120 seconds)
-3. **Toggle "Route ALL traffic through Tor"** — all system traffic is now anonymised
-4. The header displays **🌐 ALL TRAFFIC → TOR** to confirm routing is active
-5. Click **🔍 Test** to verify your Tor exit IP
-6. Use the **country dropdown** to pin your exit node to a specific country
-7. Click **🔄 New Identity** to rotate to a fresh circuit and IP
-8. **Toggle routing OFF before disconnecting** to avoid a momentary traffic gap
-9. Click **■ Disconnect** — Tor stops and all iptables rules are removed
+1. **Click Connect** — TorShield starts Tor and connects automatically
+   (Direct → Snowflake → obfs4), showing live bootstrap progress
+2. **System-wide routing turns on automatically** once connected — every step
+   (conntrack flush, TCP/DNS redirect, QUIC block) is printed in the terminal.
+   There is no switch to flip.
+3. **Wait** for circuits to appear in the right panel (~30–120 seconds)
+4. Click **Test** to verify your Tor exit IP
+5. Use the **country dropdown** to pin your exit node to a specific country
+6. Click **New Identity** to rotate to a fresh circuit and IP
+7. Click **Disconnect** — Tor stops, routing is restored, all rules removed
+8. If a new version is published, an **Update available** dialog appears at
+   launch — choose **Update now** or **Maybe later**
 
 ---
 
@@ -215,7 +217,7 @@ pyinstaller --onefile --windowed tor_vpn_gui.py
 
 | Problem | Fix |
 |---|---|
-| App doesn't start / no GUI | `sudo apt install python3-tk` |
+| App doesn't start / no GUI | `sudo apt install python3-pyqt5 python3-pyqt5.qtx11extras` then `pip install PyQt-Fluent-Widgets` |
 | Stuck at "Connecting" | Ensure `ControlPort 9051` is uncommented in `torrc` |
 | Tor stuck at 5% bootstrap | Your network is blocking Tor — add bridges to `torrc` |
 | Connection test times out | Wait until circuits appear in the right panel first |

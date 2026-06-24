@@ -5,7 +5,12 @@
 # environment is reproduced on every machine (your friend's laptop included),
 # while still allowing security patch releases.
 
-customtkinter>=5.2.2,<6.0      # Modern Tk-based dark UI toolkit
+# ── GUI (PyQt-Fluent-Widgets edition, v2.2) ──────────────────────────────────
+PyQt5>=5.15.2,<6.0             # Qt bindings the Fluent UI is built on
+PyQt-Fluent-Widgets>=1.5.0     # Fluent Design widgets (soft shadows, theming)
+# NOTE: on Linux this also needs the system package python3-pyqt5.qtx11extras
+#       (installed automatically by install.sh).
+
 stem>=1.8.2,<2.0               # Tor control-port library (circuits, NEWNYM)
 requests>=2.31.0,<3.0          # Connection test over the Tor SOCKS proxy
 PySocks>=1.7.1,<2.0            # SOCKS5 support for requests (socks5h://)

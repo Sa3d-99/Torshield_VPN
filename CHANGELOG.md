@@ -4,6 +4,33 @@ All notable changes to TorShield are documented here.
 
 ---
 
+## [2.2.0] — 2026-06-24
+
+### Added
+- **GitHub auto-update.** On launch the app checks the repo's `VERSION` file;
+  if a newer version is published it shows an "Update available" dialog with
+  **Update now** / **Maybe later**. "Update now" downloads the latest source,
+  replaces the app files in place (no sudo), and restarts.
+- **`torshield_core.py`** — the backend engine (Tor manager, bridge fetching,
+  iptables routing, updater), split out from the GUI so the interface can be
+  swapped without touching the proven logic.
+
+### Changed
+- **New GUI built on PyQt-Fluent-Widgets** (replaces customtkinter): Fluent
+  Design with soft drop shadows, a monochromatic palette and micro-interaction
+  InfoBars. The activity terminal now uses a soft, translucent (non-black)
+  surface with a larger monospace font. The whole layout is fully scalable
+  (splitter + scroll areas) for full-screen or small windows.
+- **System-wide routing is now fully automatic** on connect — the on/off switch
+  was removed. Each routing step (conntrack flush, TCP/DNS redirect, QUIC block)
+  is shown in the terminal instead.
+
+### Requirements
+- Adds `PyQt5`, `PyQt-Fluent-Widgets`, and the system package
+  `python3-pyqt5.qtx11extras` (installed by `install.sh`).
+
+---
+
 ## [2.1.0] — 2026-06-24
 
 ### Added
