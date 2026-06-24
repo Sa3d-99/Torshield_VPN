@@ -49,3 +49,4 @@ tor.pid
 # Users create their own from the template in docs/
 torrc
 torrc.local
+graphify-out/

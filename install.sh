@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# TorShield — One-Shot Installer  (Ubuntu 22.04 / Debian)
+# TorShield — One-Shot Installer  (Ubuntu / Debian / Mint / Pop!_OS)
 #
 # Usage:
 #   chmod +x install.sh
@@ -8,9 +8,14 @@
 #
 # To uninstall later:
 #   torshield-uninstall
+#
+# Goal of v2.1: install identically on ANY Debian-family laptop. Tor and its
+# pluggable-transport helpers live in different places on different distros, so
+# this installer DETECTS them and bakes the real paths into /etc/tor/torrc.
+# A missing helper is commented out instead of left to crash Tor on startup.
 # ─────────────────────────────────────────────────────────────────────────────
 
-set -e
+set -euo pipefail
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -31,14 +36,18 @@ clear
 echo -e "${BOLD}${CYAN}"
 echo "  ╔════════════════════════════════════════╗"
 echo "  ║   🛡  TorShield — System-Wide Tor VPN  ║"
-echo "  ║        Installer v2.0                  ║"
+echo "  ║        Installer v2.1                  ║"
 echo "  ╚════════════════════════════════════════╝"
 echo -e "${NC}"
 
 # ── Must NOT run as root ──────────────────────────────────────────────────────
-if [ "$EUID" -eq 0 ]; then
+if [ "${EUID}" -eq 0 ]; then
     error "Do not run this installer with sudo.\nRun as your normal user: ./install.sh\nThe script asks for your password only when needed."
 fi
+
+# Make sure we run from the project folder (so the source files are present).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
 # ── Variables ─────────────────────────────────────────────────────────────────
 REAL_USER="$USER"
@@ -48,125 +57,160 @@ BIN_LINK="/usr/local/bin/torshield"
 UNINSTALL_BIN="/usr/local/bin/torshield-uninstall"
 DESKTOP_FILE="$REAL_HOME/.local/share/applications/torshield.desktop"
 TORRC_PATH="/etc/tor/torrc"
+TORRC_TEMPLATE="$SCRIPT_DIR/torrc.template"
 LAUNCHER="$INSTALL_DIR/launch.sh"
+CONF_FILE="$INSTALL_DIR/torshield.conf"
 
 # ── Step 1 — System packages ──────────────────────────────────────────────────
 header "Step 1 — System packages"
 
 info "Updating package lists…"
-sudo apt-get update -qq
+sudo apt-get update -qq || warn "apt-get update reported a problem — continuing."
 
-PACKAGES=(tor obfs4proxy snowflake-client conntrack python3 python3-pip python3-tk git)
+# python3-tk is required for the GUI; tor for the daemon; conntrack for leak
+# flushing. The pluggable transports may not exist in every repo, so they are
+# installed best-effort and detected afterwards.
+CORE_PACKAGES=(tor conntrack python3 python3-pip python3-tk)
+OPTIONAL_PACKAGES=(obfs4proxy snowflake-client)
 
-for pkg in "${PACKAGES[@]}"; do
-    if dpkg -s "$pkg" &>/dev/null 2>&1; then
+for pkg in "${CORE_PACKAGES[@]}"; do
+    if dpkg -s "$pkg" &>/dev/null; then
         ok "$pkg — already installed"
     else
         info "Installing $pkg…"
-        sudo apt-get install -y -qq "$pkg"
+        sudo apt-get install -y -qq "$pkg" || error "Failed to install required package: $pkg"
         ok "$pkg — installed"
     fi
 done
 
-# ── Step 2 — Stop system Tor service ─────────────────────────────────────────
-header "Step 2 — Disabling system Tor service"
+for pkg in "${OPTIONAL_PACKAGES[@]}"; do
+    if dpkg -s "$pkg" &>/dev/null; then
+        ok "$pkg — already installed"
+    else
+        info "Installing $pkg (optional bridge transport)…"
+        if sudo apt-get install -y -qq "$pkg"; then
+            ok "$pkg — installed"
+        else
+            warn "$pkg not available from apt — TorShield will work without it."
+        fi
+    fi
+done
+
+# ── Step 2 — Detect Tor + transport binaries ─────────────────────────────────
+header "Step 2 — Detecting binaries on this machine"
+
+find_bin() {
+    # $1 = command name, rest = extra candidate absolute paths
+    local name="$1"; shift
+    local p
+    p="$(command -v "$name" 2>/dev/null || true)"
+    if [ -n "$p" ]; then echo "$p"; return 0; fi
+    for p in "$@"; do
+        if [ -x "$p" ]; then echo "$p"; return 0; fi
+    done
+    echo ""
+}
+
+TOR_EXE="$(find_bin tor /usr/sbin/tor /usr/bin/tor /usr/local/bin/tor)"
+[ -n "$TOR_EXE" ] || error "Tor binary not found even after install. Try: sudo apt-get install tor"
+ok "tor              → $TOR_EXE"
+
+SNOWFLAKE_CLIENT="$(find_bin snowflake-client /usr/bin/snowflake-client /usr/local/bin/snowflake-client)"
+if [ -n "$SNOWFLAKE_CLIENT" ]; then
+    ok "snowflake-client → $SNOWFLAKE_CLIENT"
+else
+    warn "snowflake-client not found — Snowflake bridge mode will be disabled."
+fi
+
+OBFS4PROXY="$(find_bin obfs4proxy /usr/bin/obfs4proxy /usr/lib/tor/obfs4proxy /usr/local/bin/obfs4proxy)"
+if [ -n "$OBFS4PROXY" ]; then
+    ok "obfs4proxy       → $OBFS4PROXY"
+else
+    warn "obfs4proxy not found — obfs4 bridge mode will be disabled."
+fi
+
+# ── Step 3 — Stop system Tor service ─────────────────────────────────────────
+header "Step 3 — Disabling system Tor service"
 info "TorShield manages Tor itself — the system service must be stopped."
 
 if systemctl is-active --quiet tor 2>/dev/null; then
-    sudo systemctl stop tor
-    ok "Tor service stopped"
+    sudo systemctl stop tor && ok "Tor service stopped"
 else
     ok "Tor service was not running"
 fi
 
 if systemctl is-enabled --quiet tor 2>/dev/null; then
-    sudo systemctl disable tor
-    ok "Tor service disabled (won't auto-start on boot)"
+    sudo systemctl disable tor 2>/dev/null && ok "Tor service disabled (won't auto-start on boot)"
 else
     ok "Tor service was already disabled"
 fi
 
-# ── Step 3 — Configure /etc/tor/torrc ────────────────────────────────────────
-header "Step 3 — Configuring /etc/tor/torrc"
+# ── Step 4 — Generate /etc/tor/torrc from the template ───────────────────────
+header "Step 4 — Generating /etc/tor/torrc"
 
-# Only adds lines that are missing — safe to run multiple times.
-# CookieAuthentication is REQUIRED for stem (Python) to connect to ControlPort.
-# Snowflake bridges are included by default so it works on censored networks
-# (Egypt, Iran, etc.) without any manual configuration.
-#
-# NOTE: The snowflake log path uses /home/$REAL_USER so it works for any
-# username — not hardcoded to a specific user like /home/jimmy.
+[ -f "$TORRC_TEMPLATE" ] || error "torrc.template not found next to install.sh."
 
-REQUIRED_LINES=(
-    "SocksPort 9050"
-    "ControlPort 9051"
-    "TransPort 9040"
-    "DNSPort 5353"
-    "AutomapHostsOnResolve 1"
-    "CookieAuthentication 1"
-    "CookieAuthFileGroupReadable 1"
-    "UseBridges 1"
-    "ClientTransportPlugin snowflake exec /usr/bin/snowflake-client -log /home/$REAL_USER/snowflake.log -url https://snowflake-broker.torproject.net/ -front foursquare.com -ice stun:stun.l.google.com:19302,stun:stun.antisip.com:3478"
-    "Bridge snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72 fingerprint=2B280B23E1107BB62ABFC40DDCC8824814F80A72 url=https://snowflake-broker.torproject.net/ front=foursquare.com"
-)
-
-if [ ! -f "$TORRC_PATH" ]; then
-    sudo touch "$TORRC_PATH"
-    ok "Created empty $TORRC_PATH"
+# Back up any existing torrc before replacing it.
+if [ -f "$TORRC_PATH" ]; then
+    BACKUP="${TORRC_PATH}.backup.$(date +%Y%m%d_%H%M%S)"
+    sudo cp "$TORRC_PATH" "$BACKUP"
+    ok "Existing torrc backed up → $BACKUP"
 fi
 
-BACKUP="${TORRC_PATH}.backup.$(date +%Y%m%d_%H%M%S)"
-sudo cp "$TORRC_PATH" "$BACKUP"
-ok "torrc backed up → $BACKUP"
+TMP_TORRC="$(mktemp)"
+trap 'rm -f "$TMP_TORRC"' EXIT
+cp "$TORRC_TEMPLATE" "$TMP_TORRC"
 
-if ! sudo grep -q "# TorShield required settings" "$TORRC_PATH"; then
-    echo "" | sudo tee -a "$TORRC_PATH" > /dev/null
-    echo "# ── TorShield required settings ─────────────────────────────────────────────" | sudo tee -a "$TORRC_PATH" > /dev/null
+# Substitute the real username and detected binary paths.
+sed -i "s|__USER__|${REAL_USER}|g" "$TMP_TORRC"
+
+if [ -n "$SNOWFLAKE_CLIENT" ]; then
+    sed -i "s|__SNOWFLAKE_CLIENT__|${SNOWFLAKE_CLIENT}|g" "$TMP_TORRC"
+else
+    # No snowflake binary → comment out its plugin + bridge so Tor can still start.
+    sed -i '/__SNOWFLAKE_CLIENT__/ s|^|# (disabled: snowflake-client not installed) |' "$TMP_TORRC"
+    sed -i '/^Bridge snowflake /     s|^|# (disabled: snowflake-client not installed) |' "$TMP_TORRC"
 fi
 
-ADDED=0
-for line in "${REQUIRED_LINES[@]}"; do
-    setting=$(echo "$line" | awk '{print $1}')
-    if sudo grep -qE "^${setting}\s" "$TORRC_PATH" 2>/dev/null; then
-        ok "$line — already present"
-    else
-        echo "$line" | sudo tee -a "$TORRC_PATH" > /dev/null
-        ok "$line — added"
-        ADDED=$((ADDED + 1))
-    fi
-done
-
-if [ "$ADDED" -eq 0 ]; then
-    info "torrc already had all required settings — nothing changed."
+if [ -n "$OBFS4PROXY" ]; then
+    sed -i "s|__OBFS4PROXY__|${OBFS4PROXY}|g" "$TMP_TORRC"
+else
+    sed -i '/__OBFS4PROXY__/ s|^|# (disabled: obfs4proxy not installed) |' "$TMP_TORRC"
 fi
 
-# ── Step 4 — Fix /var/lib/tor permissions ────────────────────────────────────
-header "Step 4 — Fixing Tor data directory permissions"
+# If neither transport is available, fall back to a direct (no-bridge) config so
+# the user still gets a working Tor instead of one that can never bootstrap.
+if [ -z "$SNOWFLAKE_CLIENT" ] && [ -z "$OBFS4PROXY" ]; then
+    sed -i 's|^UseBridges 1|UseBridges 0|' "$TMP_TORRC"
+    warn "No bridge transports installed — torrc set to DIRECT mode."
+fi
 
-# Ubuntu 22.04: Tor writes its cookie to /run/tor/control.authcookie
-# Older installs: /var/lib/tor/control_auth_cookie
-# Both must be accessible by users in the debian-tor group.
+sudo install -o root -g root -m 644 "$TMP_TORRC" "$TORRC_PATH"
+ok "Wrote $TORRC_PATH (ports, cookie auth, bridges, detected paths)"
+
+# Validate the generated config so a bad torrc never reaches the GUI.
+if sudo "$TOR_EXE" --verify-config -f "$TORRC_PATH" >/dev/null 2>&1; then
+    ok "torrc passed 'tor --verify-config'"
+else
+    warn "tor --verify-config reported issues — re-run after checking $TORRC_PATH"
+fi
+
+# ── Step 5 — Fix Tor data-directory permissions ──────────────────────────────
+header "Step 5 — Fixing Tor data directory permissions"
 
 if [ -d /var/lib/tor ]; then
     sudo chown debian-tor:debian-tor /var/lib/tor
     sudo chmod 750 /var/lib/tor
     ok "/var/lib/tor  ownership=debian-tor:debian-tor  permissions=750"
 fi
-
 if [ -d /run/tor ]; then
     sudo chown debian-tor:debian-tor /run/tor
     sudo chmod 750 /run/tor
     ok "/run/tor  ownership=debian-tor:debian-tor  permissions=750"
 fi
 
-# ── Step 5 — Add user to debian-tor group ────────────────────────────────────
-header "Step 5 — Tor group membership"
-
-# FIX: The correct command is:  usermod -a -G debian-tor $USER
-#      NOT:                      usermod -a -G $USER debian-tor   ← this is backwards
-#
-# The user must be IN the debian-tor group to read the cookie file.
-# Without this, stem cannot authenticate and circuits never appear.
+# ── Step 6 — Add user to debian-tor group ────────────────────────────────────
+header "Step 6 — Tor group membership"
 
 if getent group debian-tor > /dev/null 2>&1; then
     if id -nG "$REAL_USER" | grep -qw "debian-tor"; then
@@ -174,25 +218,32 @@ if getent group debian-tor > /dev/null 2>&1; then
     else
         sudo usermod -a -G debian-tor "$REAL_USER"
         ok "Added $REAL_USER to the debian-tor group"
-        warn "────────────────────────────────────────────────────────"
-        warn "GROUP CHANGE requires you to log out and back in."
-        warn "OR apply it right now in this terminal by running:"
-        warn "  newgrp debian-tor"
-        warn "────────────────────────────────────────────────────────"
+        warn "GROUP CHANGE needs a re-login, or run now:  newgrp debian-tor"
     fi
 else
     warn "debian-tor group not found — Tor may not be installed correctly."
 fi
 
-# ── Step 6 — Python packages ──────────────────────────────────────────────────
-header "Step 6 — Python packages"
+# ── Step 7 — Python packages (pinned, reproducible) ──────────────────────────
+header "Step 7 — Python packages"
 
-pip install --quiet --upgrade pip --break-system-packages
-pip install --quiet customtkinter stem requests PySocks fake-useragent pillow --break-system-packages
-ok "Python packages installed"
+PIP_FLAGS=(--quiet --upgrade)
+# Newer pip on Debian needs this to install outside a venv.
+if pip install --help 2>/dev/null | grep -q -- "--break-system-packages"; then
+    PIP_FLAGS+=(--break-system-packages)
+fi
 
-# ── Step 7 — Copy TorShield files ────────────────────────────────────────────
-header "Step 7 — Installing TorShield files"
+pip install "${PIP_FLAGS[@]}" pip
+if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
+    pip install "${PIP_FLAGS[@]}" -r "$SCRIPT_DIR/requirements.txt"
+    ok "Python packages installed from requirements.txt (pinned versions)"
+else
+    pip install "${PIP_FLAGS[@]}" customtkinter stem requests PySocks fake-useragent pillow
+    ok "Python packages installed"
+fi
+
+# ── Step 8 — Copy TorShield files ────────────────────────────────────────────
+header "Step 8 — Installing TorShield files"
 
 mkdir -p "$INSTALL_DIR"
 
@@ -203,7 +254,18 @@ else
     error "tor_vpn_gui.py not found! Run install.sh from inside the project folder."
 fi
 
-# Copy logo if present
+# Persist the detected paths so the GUI uses the exact same binaries we set up.
+cat > "$CONF_FILE" << CONF
+# TorShield — machine configuration written by install.sh
+# The GUI reads this so it always uses the binaries detected at install time.
+TOR_EXE=$TOR_EXE
+TORRC_PATH=$TORRC_PATH
+SNOWFLAKE_CLIENT=$SNOWFLAKE_CLIENT
+OBFS4PROXY=$OBFS4PROXY
+CONF
+ok "Saved machine config → $CONF_FILE"
+
+# Copy logos if present
 for img in Header_Logo.png torshield.png; do
     if [ -f "$img" ]; then
         cp "$img" "$INSTALL_DIR/"
@@ -213,38 +275,53 @@ for img in Header_Logo.png torshield.png; do
     fi
 done
 
-# ── Step 8 — Launcher script ──────────────────────────────────────────────────
-header "Step 8 — Creating launcher"
+# ── Step 9 — Launcher script (auto privilege elevation) ──────────────────────
+header "Step 9 — Creating launcher"
 
 cat > "$LAUNCHER" << LAUNCHER_SCRIPT
 #!/bin/bash
-# TorShield launcher — handles privilege elevation automatically
+# TorShield launcher — grabs the root privileges the app needs, automatically.
 export DISPLAY=\${DISPLAY:-:0}
 export XAUTHORITY=\${XAUTHORITY:-\$HOME/.Xauthority}
 
-if [ "\$EUID" -ne 0 ]; then
+GUI="$INSTALL_DIR/tor_vpn_gui.py"
+
+# Already root → just run.
+if [ "\$EUID" -eq 0 ]; then
+    exec python3 "\$GUI" "\$@"
+fi
+
+# Prefer pkexec (graphical password prompt). Fall back to sudo, then to running
+# unprivileged (the app still opens; only system-wide routing is disabled).
+if command -v pkexec >/dev/null 2>&1; then
     exec pkexec env \\
         DISPLAY="\$DISPLAY" \\
         XAUTHORITY="\$XAUTHORITY" \\
+        WAYLAND_DISPLAY="\${WAYLAND_DISPLAY:-}" \\
         HOME="\$HOME" \\
         PATH="\$PATH" \\
-        python3 "$INSTALL_DIR/tor_vpn_gui.py" "\$@"
-else
-    exec python3 "$INSTALL_DIR/tor_vpn_gui.py" "\$@"
+        python3 "\$GUI" "\$@" && exit 0
 fi
+
+if command -v sudo >/dev/null 2>&1 && [ -t 0 ]; then
+    exec sudo -E python3 "\$GUI" "\$@"
+fi
+
+echo "Could not elevate privileges — opening without system-wide routing."
+exec python3 "\$GUI" "\$@"
 LAUNCHER_SCRIPT
 
 chmod +x "$LAUNCHER"
 ok "Launcher created at $LAUNCHER"
 
-# ── Step 9 — Terminal command ─────────────────────────────────────────────────
-header "Step 9 — Terminal command"
+# ── Step 10 — Terminal command ────────────────────────────────────────────────
+header "Step 10 — Terminal command"
 
 sudo ln -sf "$LAUNCHER" "$BIN_LINK"
 ok "Run TorShield from any terminal: torshield"
 
-# ── Step 10 — Desktop shortcut ────────────────────────────────────────────────
-header "Step 10 — Desktop shortcut"
+# ── Step 11 — Desktop shortcut ────────────────────────────────────────────────
+header "Step 11 — Desktop shortcut"
 
 mkdir -p "$REAL_HOME/.local/share/applications"
 
@@ -270,8 +347,8 @@ if [ -d "$REAL_HOME/Desktop" ]; then
     ok "Desktop icon created"
 fi
 
-# ── Step 11 — Install uninstaller ────────────────────────────────────────────
-header "Step 11 — Installing uninstaller"
+# ── Step 12 — Install uninstaller ────────────────────────────────────────────
+header "Step 12 — Installing uninstaller"
 
 if [ -f "uninstall.sh" ]; then
     sudo cp "uninstall.sh" "$UNINSTALL_BIN"
@@ -281,10 +358,9 @@ else
     warn "uninstall.sh not found — skipping"
 fi
 
-# ── Step 12 — Safety checks ───────────────────────────────────────────────────
-header "Step 12 — Safety checks"
+# ── Step 13 — Safety checks ───────────────────────────────────────────────────
+header "Step 13 — Safety checks"
 
-# /tmp permissions
 TMP_PERMS=$(stat -c "%a" /tmp)
 if [ "$TMP_PERMS" != "1777" ]; then
     warn "/tmp permissions wrong ($TMP_PERMS) — fixing…"
@@ -294,7 +370,6 @@ else
     ok "/tmp permissions are correct (1777)"
 fi
 
-# Ports
 for PORT in 9050 9051 9040; do
     if ss -tlnp 2>/dev/null | grep -q ":$PORT "; then
         warn "Port $PORT is in use — something may conflict with Tor"
@@ -303,45 +378,23 @@ for PORT in 9050 9051 9040; do
     fi
 done
 
-# Verify cookie file exists after restart
-info "Starting Tor once to generate cookie file…"
-sudo systemctl start tor 2>/dev/null || true
-sleep 3
-
-COOKIE_FOUND=0
-for cookie in /run/tor/control.authcookie /var/lib/tor/control_auth_cookie; do
-    if [ -f "$cookie" ]; then
-        ok "Cookie file found: $cookie"
-        COOKIE_FOUND=1
-        break
-    fi
-done
-
-if [ "$COOKIE_FOUND" -eq 0 ]; then
-    warn "Cookie file not found yet — Tor may still be starting."
-    warn "Run: sudo systemctl start tor  then wait 10 seconds."
-fi
-
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${BOLD}${GREEN}  ✔  TorShield installed successfully!${NC}"
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
-echo -e "  ${YELLOW}⚠  IMPORTANT — do ONE of these before launching:${NC}"
+echo -e "  ${YELLOW}⚠  First time only — apply your new group membership:${NC}"
 echo -e "  ${BOLD}Option A (recommended):${NC}  Log out and log back in"
-echo -e "  ${BOLD}Option B (right now):${NC}     Run in this terminal:"
-echo -e "                            ${CYAN}newgrp debian-tor${NC}"
+echo -e "  ${BOLD}Option B (right now):${NC}     run  ${CYAN}newgrp debian-tor${NC}"
 echo ""
 echo -e "  How to launch:"
 echo -e "  ${BOLD}•${NC} Terminal:  ${CYAN}torshield${NC}"
-echo -e "  ${BOLD}•${NC} App menu:  Search for ${CYAN}TorShield${NC}"
+echo -e "  ${BOLD}•${NC} App menu:  search for ${CYAN}TorShield${NC}"
 if [ -d "$REAL_HOME/Desktop" ]; then
-echo -e "  ${BOLD}•${NC} Desktop:   Double-click ${CYAN}TorShield${NC} icon"
+echo -e "  ${BOLD}•${NC} Desktop:   double-click ${CYAN}TorShield${NC}"
 fi
 echo ""
+echo -e "  Connection mode is ${BOLD}Auto${NC} by default: direct first, then Snowflake/obfs4."
 echo -e "  To uninstall:  ${CYAN}torshield-uninstall${NC}"
-echo ""
-echo -e "  ${YELLOW}⚠  On a censored network (Egypt etc.)?${NC}"
-echo -e "  Get Snowflake bridges at: ${CYAN}https://bridges.torproject.org${NC}"
 echo ""

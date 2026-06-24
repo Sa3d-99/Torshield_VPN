@@ -27,22 +27,41 @@ sudo systemctl start tor
 
 ### Step 3 — Configure /etc/tor/torrc
 
+You normally do **not** do this by hand — `install.sh` generates
+`/etc/tor/torrc` from `torrc.template`, substituting the real binary paths it
+detected on your machine. If you want to do it manually:
+
 ```bash
-sudo cp torrc.template /etc/tor/torrc
-sudo nano /etc/tor/torrc
+# Replace the placeholders with paths from `which`:
+sed -e "s|__USER__|$USER|g" \
+    -e "s|__SNOWFLAKE_CLIENT__|$(command -v snowflake-client)|g" \
+    -e "s|__OBFS4PROXY__|$(command -v obfs4proxy)|g" \
+    torrc.template | sudo tee /etc/tor/torrc > /dev/null
+sudo tor --verify-config -f /etc/tor/torrc   # should print "Configuration was valid"
 ```
 
-**Required lines** (uncomment if commented out):
+**Required lines** (already in the template):
 ```
 SocksPort 9050
 ControlPort 9051
 TransPort 9040
 DNSPort 5353
 AutomapHostsOnResolve 1
+CookieAuthentication 1
+CookieAuthFileGroupReadable 1
 ```
 
-**For censored networks**, add bridges at the bottom. Get fresh ones from
-https://bridges.torproject.org — select Snowflake for best results.
+**Bridges / censored networks:** the template enables Snowflake by default and
+declares both the `snowflake` and `obfs4` transports. In the app, pick a
+**Connection Mode**:
+
+- **Auto** (default) — direct first, then Snowflake, then obfs4. Best for most
+  people, including censored networks (Egypt, Iran, etc.).
+- **Snowflake** — disguises Tor as a video call. No fresh bridge needed.
+- **obfs4** — uses your own bridges. Save them to
+  `~/.local/share/torshield/obfs4_bridges.txt` (get them from
+  https://bridges.torproject.org → obfs4).
+- **Direct** — no bridges, uncensored networks only.
 
 ### Step 4 — Python dependencies
 

@@ -27,8 +27,9 @@ toggle switch. No per-app configuration required.
 | **New Identity** | Sends `SIGNAL NEWNYM` to Tor for a fresh circuit and IP |
 | **Live circuit tracker** | Real-time 3-hop display: Entry Guard → Middle Relay → Exit Node, with IPs |
 | **Connection test** | Verifies your Tor exit IP via SOCKS5 with a randomised User-Agent |
-| **Auto privilege elevation** | Uses `pkexec` to request root — no need to launch from a terminal |
-| **Bridge support** | Works with obfs4 and Snowflake bridges for censored networks |
+| **Auto privilege elevation** | Requests root via `pkexec`, falls back to `sudo`, then runs unprivileged — never crashes if `pkexec` is missing |
+| **Auto connection mode** | Tries direct → Snowflake → obfs4 automatically and uses whichever bootstraps, with a live progress bar |
+| **Bridge-mode selector** | Switch between Auto / Snowflake / obfs4 / Direct; TorShield rewrites the managed bridge block in `torrc` for you |
 | **Standalone binary** | PyInstaller build included — run without a Python install |
 
 ---
@@ -92,9 +93,16 @@ sudo systemctl disable tor
 
 ### 3 — Configure torrc
 
+`install.sh` does this for you: it generates `/etc/tor/torrc` from
+`torrc.template`, substituting the real `tor`, `snowflake-client`, and
+`obfs4proxy` paths it detects on your machine, then validates it with
+`tor --verify-config`. To do it by hand:
+
 ```bash
-sudo cp torrc.template /etc/tor/torrc
-sudo nano /etc/tor/torrc
+sed -e "s|__USER__|$USER|g" \
+    -e "s|__SNOWFLAKE_CLIENT__|$(command -v snowflake-client)|g" \
+    -e "s|__OBFS4PROXY__|$(command -v obfs4proxy)|g" \
+    torrc.template | sudo tee /etc/tor/torrc > /dev/null
 ```
 
 The template already includes all required settings:
@@ -105,12 +113,15 @@ ControlPort 9051
 TransPort 9040
 DNSPort 5353
 AutomapHostsOnResolve 1
+CookieAuthentication 1
+CookieAuthFileGroupReadable 1
 ```
 
 > **On a censored network? (Egypt, Iran, China, etc.)**  
-> Uncomment the bridge section at the bottom of `torrc` and fill in your bridges.  
-> Get fresh bridges at https://bridges.torproject.org — choose **obfs4** or **Snowflake**.  
-> For Egypt, Snowflake with `front=foursquare.com` is known to work reliably.
+> Just leave the mode on **Auto** — TorShield tries direct, then Snowflake, then
+> obfs4 automatically. Snowflake (enabled by default, `front=foursquare.com`) is
+> known to work reliably in Egypt. For obfs4, save your own bridges from
+> https://bridges.torproject.org to `~/.local/share/torshield/obfs4_bridges.txt`.
 
 ### 4 — Install Python dependencies
 

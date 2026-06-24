@@ -1,9 +1,13 @@
-# TorShield — Python dependencies
+# TorShield — Python dependencies (pinned for reproducible installs)
 # Install with:  pip install -r requirements.txt
+#
+# Versions are pinned with a compatible-release range so the SAME working
+# environment is reproduced on every machine (your friend's laptop included),
+# while still allowing security patch releases.
 
-customtkinter>=5.2.0
-stem>=1.8.1
-requests>=2.31.0
-PySocks>=1.7.1        # SOCKS5 support for requests
-fake-useragent>=1.4.0 # Optional — User-Agent randomisation
-Pillow>=10.0.0        # Logo image display in the header
+customtkinter>=5.2.2,<6.0      # Modern Tk-based dark UI toolkit
+stem>=1.8.2,<2.0               # Tor control-port library (circuits, NEWNYM)
+requests>=2.31.0,<3.0          # Connection test over the Tor SOCKS proxy
+PySocks>=1.7.1,<2.0            # SOCKS5 support for requests (socks5h://)
+fake-useragent>=1.5.1,<2.0     # Optional — User-Agent randomisation
+Pillow>=10.2.0,<12.0           # Logo image display in the header
