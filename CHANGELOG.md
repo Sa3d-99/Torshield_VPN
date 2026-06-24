@@ -7,12 +7,17 @@ All notable changes to TorShield are documented here.
 ## [2.1.0] — 2026-06-24
 
 ### Added
-- **Auto connection mode** — tries a direct Tor connection first, then
+- **Fully automatic connection** — tries a direct Tor connection first, then
   automatically falls back to Snowflake and obfs4 bridges if Tor cannot
-  bootstrap. Live bootstrap progress bar in the UI.
-- **Bridge-mode selector** (Auto / Snowflake / obfs4 / Direct). TorShield
-  rewrites the managed bridge block of `/etc/tor/torrc` for the chosen mode.
-- Saved obfs4 bridges file at `~/.local/share/torshield/obfs4_bridges.txt`.
+  bootstrap. No connection mode to choose. Live bootstrap progress bar.
+- **Automatic bridge fetching** — obfs4 bridges are pulled from Tor's BridgeDB
+  via the captcha-free moat API (the same one Tor Browser uses), at install
+  time and refreshed in the app. Nothing is hardcoded or pasted by hand.
+  A **Refresh bridges** button fetches a fresh set on demand.
+- Cached obfs4 bridges at `~/.local/share/torshield/obfs4_bridges.txt`.
+- **Automatic system-wide routing** — when you connect (as root), ALL traffic is
+  routed through Tor immediately. The switch remains as an optional override to
+  temporarily go direct, and routing is restored on disconnect/close.
 - Machine config (`torshield.conf`) written by the installer so the GUI always
   uses the exact Tor/transport binaries detected at install time.
 

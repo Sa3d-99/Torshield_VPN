@@ -28,8 +28,9 @@ toggle switch. No per-app configuration required.
 | **Live circuit tracker** | Real-time 3-hop display: Entry Guard → Middle Relay → Exit Node, with IPs |
 | **Connection test** | Verifies your Tor exit IP via SOCKS5 with a randomised User-Agent |
 | **Auto privilege elevation** | Requests root via `pkexec`, falls back to `sudo`, then runs unprivileged — never crashes if `pkexec` is missing |
-| **Auto connection mode** | Tries direct → Snowflake → obfs4 automatically and uses whichever bootstraps, with a live progress bar |
-| **Bridge-mode selector** | Switch between Auto / Snowflake / obfs4 / Direct; TorShield rewrites the managed bridge block in `torrc` for you |
+| **Fully automatic connection** | Tries direct → Snowflake → obfs4 and uses whichever bootstraps, with a live progress bar. No modes to pick. |
+| **Auto-fetched bridges** | obfs4 bridges are fetched automatically from Tor's BridgeDB (the captcha-free moat API) — nothing to paste or configure |
+| **Auto system-wide routing** | On connect (as root), ALL traffic is routed through Tor immediately — no extra switch to flip; restored on disconnect |
 | **Standalone binary** | PyInstaller build included — run without a Python install |
 
 ---
@@ -118,10 +119,11 @@ CookieAuthFileGroupReadable 1
 ```
 
 > **On a censored network? (Egypt, Iran, China, etc.)**  
-> Just leave the mode on **Auto** — TorShield tries direct, then Snowflake, then
-> obfs4 automatically. Snowflake (enabled by default, `front=foursquare.com`) is
-> known to work reliably in Egypt. For obfs4, save your own bridges from
-> https://bridges.torproject.org to `~/.local/share/torshield/obfs4_bridges.txt`.
+> Nothing to do — it's automatic. TorShield tries direct, then Snowflake, then
+> obfs4. Snowflake (default, `front=foursquare.com`) works reliably in Egypt,
+> and obfs4 bridges are **fetched automatically** from Tor's BridgeDB and cached
+> at `~/.local/share/torshield/obfs4_bridges.txt`. Use the **Refresh bridges**
+> button in the app to pull a fresh set on demand.
 
 ### 4 — Install Python dependencies
 

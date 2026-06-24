@@ -7,13 +7,15 @@ iptables transparent proxying. No need to configure individual apps.
 Highlights (v2.1):
   • Portable: Tor + transport binaries are auto-detected (or read from the
     install-time config) so it runs the same on any Debian-family laptop.
-  • Resilient connect: an "Auto" mode tries a DIRECT connection first and
-    automatically falls back to Snowflake / obfs4 bridges if Tor cannot
-    bootstrap — the main fix for "it won't connect on my friend's machine".
+  • Fully automatic connect: tries DIRECT first, then Snowflake, then obfs4,
+    and uses whichever bootstraps — no modes to choose. This is the main fix
+    for "it won't connect on my friend's machine".
+  • Automatic bridges: obfs4 bridges are fetched from Tor's BridgeDB (the
+    captcha-free moat API) — nothing hardcoded or pasted by hand.
   • Safe elevation: if pkexec is missing it degrades gracefully instead of
     crashing on launch.
-  • Refreshed UI: slate-dark theme, monospace terminal log, live 3-hop
-    circuit visualisation.
+  • Refreshed, scalable UI: slate-dark theme, monospace terminal log, live
+    3-hop circuit visualisation.
 
 Dependencies:  pip install -r requirements.txt
 Setup:         run install.sh once, then type: torshield
@@ -85,6 +87,12 @@ try:
 except ImportError:
     _PIL_AVAILABLE = False
 
+try:
+    from PIL import ImageTk          # for the window/taskbar icon
+    _IMAGETK_AVAILABLE = True
+except Exception:
+    _IMAGETK_AVAILABLE = False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Machine configuration — written by install.sh, with safe auto-detection
@@ -141,8 +149,17 @@ DNS_PORT     = 5353
 CONTROL_PORT = 9051
 CONTROL_HOST = "127.0.0.1"
 
-# Where the user's own obfs4 bridges live (added via the app / bridges.torproject.org)
-OBFS4_BRIDGES_FILE = os.path.expanduser("~/.local/share/torshield/obfs4_bridges.txt")
+# Bridges are fetched automatically from Tor's BridgeDB and cached here.
+OBFS4_BRIDGES_FILE     = os.path.expanduser("~/.local/share/torshield/obfs4_bridges.txt")
+SNOWFLAKE_BRIDGES_FILE = os.path.expanduser("~/.local/share/torshield/snowflake_bridges.txt")
+
+# Tor's captcha-free "moat" circumvention API — the same service Tor Browser
+# uses to configure bridges automatically. We POST to these to GENERATE fresh
+# bridges from the internet instead of asking the user to paste any.
+MOAT_SETTINGS_URL = "https://bridges.torproject.org/moat/circumvention/settings"
+MOAT_BUILTIN_URL  = "https://bridges.torproject.org/moat/circumvention/builtin"
+# Bridges are considered stale after this many seconds → auto-refreshed.
+BRIDGE_MAX_AGE = 60 * 60 * 24 * 3   # 3 days
 
 # The standard Snowflake bridge line (the IP is a placeholder — the broker
 # rendezvouses real peers, so no fresh certificate is ever needed).
@@ -271,22 +288,151 @@ def ts() -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # torrc bridge management (writes the managed block between the markers)
 # ─────────────────────────────────────────────────────────────────────────────
-def load_obfs4_bridges() -> list[str]:
-    """Return user-supplied obfs4 'Bridge obfs4 ...' lines, if any."""
+# Both obfs4 and snowflake bridges are fetched the same way from Tor BridgeDB.
+_BRIDGE_FILES = {
+    "obfs4":     OBFS4_BRIDGES_FILE,
+    "snowflake": SNOWFLAKE_BRIDGES_FILE,
+}
+
+
+def _norm_bridge(line: str) -> str:
+    line = line.strip()
+    if line and not line.lower().startswith("bridge "):
+        line = "Bridge " + line
+    return line
+
+
+def _load_bridges(kind: str) -> list[str]:
+    """Return cached 'Bridge <kind> ...' lines for obfs4 or snowflake."""
+    path = _BRIDGE_FILES[kind]
     lines: list[str] = []
-    if os.path.isfile(OBFS4_BRIDGES_FILE):
+    if os.path.isfile(path):
         try:
-            with open(OBFS4_BRIDGES_FILE, encoding="utf-8") as fh:
+            with open(path, encoding="utf-8") as fh:
                 for raw in fh:
                     raw = raw.strip()
                     if not raw or raw.startswith("#"):
                         continue
-                    if not raw.lower().startswith("bridge "):
-                        raw = "Bridge " + raw
-                    lines.append(raw)
+                    lines.append(_norm_bridge(raw))
         except Exception:
             pass
     return lines
+
+
+def load_obfs4_bridges() -> list[str]:
+    return _load_bridges("obfs4")
+
+
+def load_snowflake_bridges() -> list[str]:
+    """Fetched snowflake bridges, or the proven built-in line as a fallback."""
+    lines = _load_bridges("snowflake")
+    return lines if lines else [SNOWFLAKE_BRIDGE_LINE]
+
+
+def _file_stale(path: str) -> bool:
+    if not os.path.isfile(path):
+        return True
+    try:
+        return (time.time() - os.path.getmtime(path)) > BRIDGE_MAX_AGE
+    except Exception:
+        return True
+
+
+def bridges_are_stale() -> bool:
+    """True if either bridge cache is missing/empty or older than BRIDGE_MAX_AGE."""
+    return (_file_stale(OBFS4_BRIDGES_FILE) or not _load_bridges("obfs4")
+            or _file_stale(SNOWFLAKE_BRIDGES_FILE))
+
+
+def fetch_bridges(kind: str, country: str = "", timeout: float = 20.0) -> list[str]:
+    """
+    GENERATE fresh bridges of `kind` ("obfs4" or "snowflake") automatically from
+    Tor's BridgeDB (moat) — the same captcha-free API Tor Browser uses. No manual
+    pasting, nothing hardcoded.
+
+    Tries the per-country 'settings' endpoint first (fresher, rotated bridges),
+    then the maintained 'builtin' list. Returns 'Bridge <kind> …' lines
+    (deduplicated), or [] on any network failure.
+    """
+    headers = {"Content-Type": "application/vnd.api+json"}
+    collected: list[str] = []
+
+    # 1. Country-aware settings endpoint (bridgedb source — freshest)
+    try:
+        payload = {"country": country} if country else {}
+        resp = requests.post(MOAT_SETTINGS_URL, json=payload,
+                             headers=headers, timeout=timeout)
+        if resp.ok:
+            for setting in resp.json().get("settings", []):
+                br = setting.get("bridges", {})
+                if br.get("type") == kind:
+                    for s in br.get("bridge_strings", []):
+                        collected.append(_norm_bridge(s))
+    except Exception:
+        pass
+
+    # 2. Built-in list (always available, maintained by the Tor Project)
+    try:
+        resp = requests.post(MOAT_BUILTIN_URL, headers=headers, timeout=timeout)
+        if resp.ok:
+            for s in resp.json().get(kind, []):
+                collected.append(_norm_bridge(s))
+    except Exception:
+        pass
+
+    seen, out = set(), []
+    for line in collected:
+        if line and line not in seen:
+            seen.add(line)
+            out.append(line)
+    return out
+
+
+# Backwards-compatible alias
+def fetch_obfs4_bridges(country: str = "", timeout: float = 20.0) -> list[str]:
+    return fetch_bridges("obfs4", country, timeout)
+
+
+def save_bridges(kind: str, lines: list[str]) -> bool:
+    """Persist fetched bridges of `kind` to its cache file."""
+    if not lines:
+        return False
+    path = _BRIDGE_FILES[kind]
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        header = (f"# {kind} bridges fetched automatically from Tor BridgeDB (moat)\n"
+                  f"# generated {datetime.now().isoformat(timespec='seconds')}\n"
+                  "# do not edit — TorShield refreshes this automatically\n")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(header)
+            fh.write("\n".join(lines) + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def refresh_all_bridges(country: str = "", force: bool = False) -> dict[str, int]:
+    """
+    Fetch+save BOTH obfs4 and snowflake bridges if stale (or forced).
+    Returns {'obfs4': n, 'snowflake': n} of how many are available afterwards.
+    """
+    result: dict[str, int] = {}
+    for kind in ("obfs4", "snowflake"):
+        path = _BRIDGE_FILES[kind]
+        if not force and not _file_stale(path) and _load_bridges(kind):
+            result[kind] = len(_load_bridges(kind))
+            continue
+        lines = fetch_bridges(kind, country)
+        if lines and save_bridges(kind, lines):
+            result[kind] = len(lines)
+        else:
+            result[kind] = len(_load_bridges(kind))
+    return result
+
+
+def refresh_obfs4_bridges(country: str = "", force: bool = False) -> int:
+    """Backwards-compatible single-transport refresh (obfs4)."""
+    return refresh_all_bridges(country, force).get("obfs4", 0)
 
 
 def build_bridge_block(mode: str) -> str:
@@ -297,7 +443,7 @@ def build_bridge_block(mode: str) -> str:
     elif mode == "Snowflake":
         body.append("UseBridges 1")
         if SNOWFLAKE_CLIENT:
-            body.append(SNOWFLAKE_BRIDGE_LINE)
+            body.extend(load_snowflake_bridges())
     elif mode == "obfs4":
         body.append("UseBridges 1")
         body.extend(load_obfs4_bridges())
@@ -683,9 +829,19 @@ class TorShieldApp(ctk.CTk):
         MONO_FAMILY = _pick_family(_MONO_CANDIDATES, "monospace")
         UI_FAMILY   = _pick_family(_UI_CANDIDATES, "sans-serif")
 
+        # Scale the whole UI to the screen so it stays comfortable on small
+        # laptops and sharp on hi-DPI displays.
+        try:
+            sw = self.winfo_screenwidth()
+            scale = 0.85 if sw <= 1366 else (1.15 if sw >= 2560 else 1.0)
+            ctk.set_widget_scaling(scale)
+            ctk.set_window_scaling(scale)
+        except Exception:
+            pass
+
         self.title("TorShield  ·  System-Wide Tor VPN")
-        self.geometry("1040x740")
-        self.minsize(900, 660)
+        self.geometry("1060x760")
+        self.minsize(880, 640)
         self.configure(fg_color=THEME["bg"])
 
         self._tor    = TorManager()
@@ -694,23 +850,96 @@ class TorShieldApp(ctk.CTk):
         self._after_id: Optional[str] = None
         self._connect_time: Optional[float] = None
 
-        self._bridge_mode = ctk.StringVar(value="Auto")
-
         self._logo_image = None
         if _PIL_AVAILABLE:
-            _logo_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "Header_Logo.png")
-            if os.path.isfile(_logo_path):
-                try:
-                    _pil = Image.open(_logo_path).resize((38, 38), Image.LANCZOS)
-                    self._logo_image = ctk.CTkImage(
-                        light_image=_pil, dark_image=_pil, size=(38, 38))
-                except Exception:
-                    self._logo_image = None
+            _sq = self._load_square_logo(38)   # square → header logo is not distorted
+            if _sq is not None:
+                self._logo_image = ctk.CTkImage(
+                    light_image=_sq, dark_image=_sq, size=(38, 38))
 
         self._build_ui()
+        self._apply_window_icon()              # square taskbar/titlebar icon
         self._print_environment()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ── Logo / icon helpers ──────────────────────────────────────────────────
+    def _logo_source(self) -> Optional[str]:
+        """Path to the best available logo, preferring the square emblem."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        for name in ("Header_Logo.png", "torshield.png"):
+            p = os.path.join(here, name)
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def _load_square_logo(self, size: int):
+        """
+        Return a square PIL image of the logo at `size`×`size`, padded with
+        transparency so a non-square source (e.g. the 677×369 wordmark) keeps
+        its aspect ratio instead of being stretched.
+        """
+        if not _PIL_AVAILABLE:
+            return None
+        src = self._logo_source()
+        if not src:
+            return None
+        try:
+            img = Image.open(src).convert("RGBA")
+            w, h = img.size
+            if w != h:                         # pad the short side → square canvas
+                side = max(w, h)
+                canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+                canvas.paste(img, ((side - w) // 2, (side - h) // 2), img)
+                img = canvas
+            return img.resize((size, size), Image.LANCZOS)
+        except Exception:
+            return None
+
+    def _apply_window_icon(self) -> None:
+        """Set a correctly-proportioned window/taskbar icon (no stretching)."""
+        if not _IMAGETK_AVAILABLE:
+            return
+        sq = self._load_square_logo(128)
+        if sq is None:
+            return
+        try:
+            self._icon_image = ImageTk.PhotoImage(sq)   # keep a reference (no GC)
+            self.iconphoto(True, self._icon_image)
+        except Exception:
+            pass
+
+        # Quietly refresh obfs4 bridges from Tor in the background at startup so
+        # they are ready the moment they are needed — fully automatic.
+        if OBFS4PROXY:
+            threading.Thread(target=self._prefetch_bridges, daemon=True).start()
+
+    def _prefetch_bridges(self) -> None:
+        try:
+            country = COUNTRY_CODES.get(self._country_var.get(), "").strip("{}")
+            if bridges_are_stale():
+                self._set_bridge_status("↻  fetching bridges from Tor…", "info")
+                self._log("Fetching fresh obfs4 + snowflake bridges from Tor…", "info")
+                counts = refresh_all_bridges(country=country)
+            else:
+                counts = {"obfs4": len(load_obfs4_bridges()),
+                          "snowflake": len(_load_bridges("snowflake"))}
+            self._report_bridge_counts(counts, fetched=bridges_are_stale())
+        except Exception:
+            pass
+
+    def _report_bridge_counts(self, counts: dict, fetched: bool = True) -> None:
+        o = counts.get("obfs4", 0)
+        s = counts.get("snowflake", 0)
+        if o or s:
+            self._set_bridge_status(
+                f"✔  {o} obfs4 · {s} snowflake bridges ready", "success")
+            self._log(f"Bridges ready: {o} obfs4, {s} snowflake "
+                      f"(from Tor BridgeDB).", "ok")
+        else:
+            self._set_bridge_status("⚠  fetch failed — built-in fallback in use",
+                                    "warning")
+            self._log("Could not fetch bridges now — using the built-in "
+                      "Snowflake fallback automatically.", "warn")
 
     # ── Fonts ────────────────────────────────────────────────────────────────
     def _mono(self, size: int, weight: str = "normal") -> ctk.CTkFont:
@@ -822,34 +1051,28 @@ class TorShieldApp(ctk.CTk):
         self._progress_label.pack(anchor="w", padx=18, pady=(2, 0))
 
         self._divider(parent)
-        self._section(parent, "Connection Mode (bridges)")
+        self._section(parent, "Automatic Bridges")
 
         info = self._card(parent)
         ctk.CTkLabel(
             info,
-            text=("Auto tries a direct connection first, then falls\n"
-                  "back to Snowflake / obfs4 bridges if blocked.\n"
-                  "Best choice on a censored network."),
+            text=("Fully automatic. TorShield tries a direct connection,\n"
+                  "then Snowflake, then fresh obfs4 bridges it fetches\n"
+                  "from Tor's BridgeDB — nothing to configure."),
             font=self._mono(10), text_color=THEME["subtext"],
             justify="left").pack(padx=10, pady=8, anchor="w")
 
-        modes = ["Auto", "Snowflake", "obfs4", "Direct"]
-        self._mode_menu = ctk.CTkSegmentedButton(
-            parent, values=modes, variable=self._bridge_mode,
-            font=self._mono(11, "bold"),
-            selected_color=THEME["accent"],
-            selected_hover_color=THEME["accent_hover"],
-            unselected_color=THEME["card"],
-            unselected_hover_color=THEME["card_alt"],
-            fg_color=THEME["card"], text_color=THEME["text"],
-            command=self._on_mode_change)
-        self._mode_menu.pack(fill="x", padx=14, pady=(0, 4))
+        self._bridge_status = ctk.CTkLabel(
+            parent, text="◌  bridges: checking…", font=self._mono(10, "bold"),
+            text_color=THEME["info"], justify="left", wraplength=280)
+        self._bridge_status.pack(anchor="w", padx=18, pady=(0, 2))
 
-        self._mode_hint = ctk.CTkLabel(
-            parent, text="", font=self._mono(9), text_color=THEME["muted"],
-            justify="left", wraplength=270)
-        self._mode_hint.pack(anchor="w", padx=18, pady=(0, 4))
-        self._refresh_mode_hint()
+        self._refresh_bridges_btn = ctk.CTkButton(
+            parent, text="↻  Refresh bridges from Tor",
+            font=self._mono(11, "bold"), fg_color=THEME["card"],
+            hover_color=THEME["card_alt"], text_color=THEME["info"],
+            height=34, corner_radius=9, command=self._on_refresh_bridges)
+        self._refresh_bridges_btn.pack(fill="x", padx=14, pady=(2, 4))
 
         self._divider(parent)
         self._section(parent, "System-Wide Traffic Routing")
@@ -857,13 +1080,14 @@ class TorShieldApp(ctk.CTk):
         info2 = self._card(parent)
         ctk.CTkLabel(
             info2,
-            text=("When ON — every app (Chrome, curl, Discord…)\n"
-                  "uses Tor automatically. No per-app setup."),
+            text=("Turns ON automatically when you connect — every app\n"
+                  "(Chrome, curl, Discord…) goes through Tor with no\n"
+                  "per-app setup. Toggle off only to temporarily go direct."),
             font=self._mono(10), text_color=THEME["subtext"],
             justify="left").pack(padx=10, pady=8, anchor="w")
 
         self._routing_switch = ctk.CTkSwitch(
-            parent, text="Route ALL traffic through Tor",
+            parent, text="All traffic through Tor (auto)",
             font=self._mono(12, "bold"), text_color=THEME["text"],
             progress_color=THEME["success"], button_color=THEME["accent"],
             button_hover_color=THEME["accent_hover"],
@@ -934,7 +1158,7 @@ class TorShieldApp(ctk.CTk):
         self._circ_ts.pack(side="right")
 
         self._circuit_box = ctk.CTkTextbox(
-            parent, font=self._mono(11), fg_color=THEME["log_bg"],
+            parent, font=self._mono(12), fg_color=THEME["log_bg"],
             text_color=THEME["text"], corner_radius=10, wrap="none",
             height=210, activate_scrollbars=True, state="disabled")
         self._circuit_box.pack(fill="x", padx=14, pady=(0, 4))
@@ -966,6 +1190,9 @@ class TorShieldApp(ctk.CTk):
         """Configure colour tags on the underlying tkinter Text widget."""
         try:
             t = box._textbox  # CTkTextbox wraps a tkinter.Text
+            # Comfortable line spacing + a little left padding so the terminal
+            # reads cleanly instead of feeling cramped.
+            t.configure(spacing1=3, spacing3=3, padx=8, pady=6)
             t.tag_config("ok",    foreground=THEME["success"])
             t.tag_config("warn",  foreground=THEME["warning"])
             t.tag_config("error", foreground=THEME["danger"])
@@ -1041,7 +1268,7 @@ class TorShieldApp(ctk.CTk):
             self._disconnect_btn.configure(state="normal")
             self._newid_btn.configure(state="normal")
             self._test_btn.configure(state="normal")
-            self._mode_menu.configure(state="disabled")
+            self._refresh_bridges_btn.configure(state="disabled")
             if check_root():
                 self._routing_switch.configure(state="normal")
             self._connect_time = time.time()
@@ -1054,7 +1281,7 @@ class TorShieldApp(ctk.CTk):
                       self._newid_btn, self._test_btn):
                 b.configure(state="disabled")
             self._routing_switch.configure(state="disabled")
-            self._mode_menu.configure(state="disabled")
+            self._refresh_bridges_btn.configure(state="disabled")
         else:
             self._status_badge.configure(text="●  DISCONNECTED",
                                          text_color=THEME["disconnected"])
@@ -1063,7 +1290,7 @@ class TorShieldApp(ctk.CTk):
             self._newid_btn.configure(state="disabled")
             self._test_btn.configure(state="disabled")
             self._routing_switch.configure(state="disabled")
-            self._mode_menu.configure(state="normal")
+            self._refresh_bridges_btn.configure(state="normal")
             self._connect_time = None
             if self._after_id:
                 self.after_cancel(self._after_id)
@@ -1079,26 +1306,27 @@ class TorShieldApp(ctk.CTk):
             self._uptime_label.configure(text=f"Uptime: {h:02d}:{m:02d}:{s:02d}")
             self._after_id = self.after(1000, self._update_uptime)
 
-    # ── Mode hint ────────────────────────────────────────────────────────────
-    def _refresh_mode_hint(self) -> None:
-        mode = self._bridge_mode.get()
-        if mode == "Snowflake" and not SNOWFLAKE_CLIENT:
-            txt, col = "snowflake-client not installed — install it or use Auto.", THEME["warning"]
-        elif mode == "obfs4" and not load_obfs4_bridges():
-            txt, col = ("No obfs4 bridges saved. Add lines to\n"
-                        f"{OBFS4_BRIDGES_FILE}"), THEME["warning"]
-        else:
-            txt, col = {
-                "Auto":      "Direct → Snowflake → obfs4, automatically.",
-                "Snowflake": "Disguises Tor as a video call (good for Egypt/Iran).",
-                "obfs4":     "Uses your saved obfs4 bridges.",
-                "Direct":    "No bridges — only on uncensored networks.",
-            }.get(mode, ""), THEME["muted"]
-        self._mode_hint.configure(text=txt, text_color=col)
+    # ── Bridge status ────────────────────────────────────────────────────────
+    def _set_bridge_status(self, text: str, color_key: str = "info") -> None:
+        self.after(0, lambda: self._bridge_status.configure(
+            text=text, text_color=THEME[color_key]))
 
-    def _on_mode_change(self, _value=None) -> None:
-        self._refresh_mode_hint()
-        self._log(f"Connection mode set to: {self._bridge_mode.get()}", "info")
+    def _on_refresh_bridges(self) -> None:
+        self._refresh_bridges_btn.configure(state="disabled")
+        self._set_bridge_status("↻  fetching bridges from Tor…", "info")
+        def _worker():
+            try:
+                country = COUNTRY_CODES.get(self._country_var.get(), "").strip("{}")
+                counts = refresh_all_bridges(country=country, force=True)
+                self._report_bridge_counts(counts)
+            except Exception as exc:
+                self._set_bridge_status("✖  fetch error", "danger")
+                self._log(f"Bridge fetch error: {exc}", "error")
+            finally:
+                if self._status != "connected":
+                    self.after(0, lambda: self._refresh_bridges_btn.configure(
+                        state="normal"))
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ── Circuit display ──────────────────────────────────────────────────────
     def _update_circuit_display(self, circuits: list[dict]) -> None:
@@ -1131,16 +1359,13 @@ class TorShieldApp(ctk.CTk):
             self._circ_ts.configure(text=f"updated {ts()}")
         self.after(0, _render)
 
-    # ── Connection strategy ──────────────────────────────────────────────────
+    # ── Connection strategy (always automatic) ───────────────────────────────
     def _build_mode_sequence(self) -> list[str]:
-        """Return the ordered list of concrete modes to attempt."""
-        mode = self._bridge_mode.get()
-        if mode != "Auto":
-            return [mode]
+        """The fixed automatic plan: Direct → Snowflake → obfs4."""
         seq = ["Direct"]
         if SNOWFLAKE_CLIENT:
             seq.append("Snowflake")
-        if OBFS4PROXY and load_obfs4_bridges():
+        if OBFS4PROXY:
             seq.append("obfs4")
         return seq
 
@@ -1148,6 +1373,15 @@ class TorShieldApp(ctk.CTk):
         """Configure torrc for `mode`, (re)start Tor, wait for bootstrap."""
         self._log(f"Trying connection mode: {mode}…", "accent")
         self._set_progress(0, f"{mode}: starting Tor…")
+
+        # obfs4 needs bridges — fetch them on demand if we don't have any yet.
+        if mode == "obfs4" and not load_obfs4_bridges():
+            self._log("No obfs4 bridges cached — fetching from Tor now…", "info")
+            country = COUNTRY_CODES.get(self._country_var.get(), "").strip("{}")
+            refresh_obfs4_bridges(country=country, force=True)
+            if not load_obfs4_bridges():
+                self._log("obfs4 unavailable (could not fetch bridges).", "warn")
+                return False
 
         if check_root():
             try:
@@ -1213,8 +1447,15 @@ class TorShieldApp(ctk.CTk):
                 self._tor.start_circuit_monitoring(
                     callback=self._update_circuit_display, interval=5.0)
                 self.after(0, lambda: self._set_status("connected"))
-                self._log(f"Connected via {connected_mode}! Enable the routing "
-                          "switch to send ALL traffic through Tor.", "ok")
+                self._log(f"Connected via {connected_mode}!", "ok")
+
+                # Route ALL system traffic through Tor automatically — no extra
+                # click. Requires root; if unprivileged we just inform the user.
+                if check_root():
+                    self._activate_routing()
+                else:
+                    self._log("Not root — system-wide routing unavailable. "
+                              "Launch via the 'torshield' command for it.", "warn")
             except Exception as exc:
                 self.after(0, lambda: self._set_status("disconnected"))
                 self._log(f"Post-connect error: {exc}", "error")
@@ -1240,22 +1481,29 @@ class TorShieldApp(ctk.CTk):
             self._log("Tor stopped. All circuits closed.", "ok")
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _activate_routing(self) -> None:
+        """Turn on system-wide routing (used automatically right after connect)."""
+        self._log("Routing ALL system traffic through Tor…")
+        def _enable():
+            ok, msg = enable_system_routing()
+            self._system_routing_active = ok
+            self._log(msg, "ok" if ok else "error")
+            if ok:
+                self.after(0, self._routing_switch.select)
+                self.after(0, lambda: self._routing_badge.configure(
+                    text="🌐 ALL TRAFFIC → TOR", text_color=THEME["success"]))
+                self._log("Every app on this machine now uses Tor.", "ok")
+            else:
+                self.after(0, self._routing_switch.deselect)
+        threading.Thread(target=_enable, daemon=True).start()
+
     def _on_routing_toggle(self) -> None:
+        # The switch is ON automatically after connecting. It stays as an
+        # optional override so the user can temporarily go direct if needed.
         if self._routing_switch.get():
-            self._log("Enabling system-wide routing via iptables…")
-            def _enable():
-                ok, msg = enable_system_routing()
-                self._system_routing_active = ok
-                self._log(msg, "ok" if ok else "error")
-                if ok:
-                    self.after(0, lambda: self._routing_badge.configure(
-                        text="🌐 ALL TRAFFIC → TOR", text_color=THEME["success"]))
-                    self._log("Every app on this machine now uses Tor.", "ok")
-                else:
-                    self.after(0, self._routing_switch.deselect)
-            threading.Thread(target=_enable, daemon=True).start()
+            self._activate_routing()
         else:
-            self._log("Disabling system-wide routing…")
+            self._log("Disabling system-wide routing (going direct)…")
             def _disable():
                 ok, msg = disable_system_routing()
                 self._system_routing_active = False

@@ -51,17 +51,19 @@ CookieAuthentication 1
 CookieAuthFileGroupReadable 1
 ```
 
-**Bridges / censored networks:** the template enables Snowflake by default and
-declares both the `snowflake` and `obfs4` transports. In the app, pick a
-**Connection Mode**:
+**Bridges / censored networks:** fully automatic — there is no mode to pick.
+The template enables Snowflake by default and declares both the `snowflake` and
+`obfs4` transports. When you press **Connect**, TorShield tries, in order:
 
-- **Auto** (default) — direct first, then Snowflake, then obfs4. Best for most
-  people, including censored networks (Egypt, Iran, etc.).
-- **Snowflake** — disguises Tor as a video call. No fresh bridge needed.
-- **obfs4** — uses your own bridges. Save them to
-  `~/.local/share/torshield/obfs4_bridges.txt` (get them from
-  https://bridges.torproject.org → obfs4).
-- **Direct** — no bridges, uncensored networks only.
+1. **Direct** — fastest, on uncensored networks.
+2. **Snowflake** — disguises Tor as a video call (works reliably in Egypt/Iran).
+3. **obfs4** — using bridges it **fetches automatically** from Tor's BridgeDB
+   (the captcha-free moat API) and caches at
+   `~/.local/share/torshield/obfs4_bridges.txt`.
+
+`install.sh` pre-fetches the obfs4 bridges during setup; the app also refreshes
+them in the background on launch and via the **Refresh bridges** button. You
+never paste bridges by hand.
 
 ### Step 4 — Python dependencies
 

@@ -10,9 +10,9 @@
 #   # >>> TORSHIELD MANAGED BRIDGES — DO NOT EDIT BY HAND <<<
 # and
 #   # <<< TORSHIELD MANAGED BRIDGES END >>>
-# is rewritten automatically by TorShield every time you pick a connection
-# mode in the app (Auto / Snowflake / obfs4 / Direct). Edit it by hand only
-# if the app is closed.
+# is rewritten automatically by TorShield as it connects. Connection is fully
+# automatic (direct → Snowflake → obfs4); obfs4 bridges are fetched from Tor's
+# BridgeDB automatically. Edit this block by hand only if the app is closed.
 #
 # To apply manual changes:  sudo systemctl restart tor   (or reconnect in app)
 # ─────────────────────────────────────────────────────────────────────────────

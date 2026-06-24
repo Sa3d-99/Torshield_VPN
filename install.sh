@@ -275,6 +275,79 @@ for img in Header_Logo.png torshield.png; do
     fi
 done
 
+# ── Step 8b — Fetch bridges automatically from Tor ────────────────────────────
+header "Step 8b — Fetching bridges from Tor"
+
+# Pull fresh obfs4 AND snowflake bridges from Tor's captcha-free BridgeDB (moat)
+# — the same service Tor Browser uses. Nothing is hardcoded or entered by hand.
+# Non-fatal if the network blocks it: the app retries the fetch itself on launch
+# and falls back to the built-in Snowflake line.
+fetch_kind() {
+    # $1 = transport kind (obfs4|snowflake), $2 = output file
+    python3 - "$1" "$2" <<'PYFETCH'
+import sys, datetime
+try:
+    import requests
+except Exception:
+    sys.exit(1)
+kind, outfile = sys.argv[1], sys.argv[2]
+H = {"Content-Type": "application/vnd.api+json"}
+lines = []
+for url, key in (("https://bridges.torproject.org/moat/circumvention/settings", "settings"),
+                 ("https://bridges.torproject.org/moat/circumvention/builtin", "builtin")):
+    try:
+        r = requests.post(url, json={} if key == "settings" else None, headers=H, timeout=25)
+        if not r.ok:
+            continue
+        data = r.json()
+        if key == "settings":
+            for s in data.get("settings", []):
+                b = s.get("bridges", {})
+                if b.get("type") == kind:
+                    lines += b.get("bridge_strings", [])
+        else:
+            lines += data.get(kind, [])
+    except Exception:
+        pass
+seen, out = set(), []
+for l in lines:
+    l = l.strip()
+    if l and not l.lower().startswith("bridge "):
+        l = "Bridge " + l
+    if l and l not in seen:
+        seen.add(l); out.append(l)
+if not out:
+    sys.exit(2)
+with open(outfile, "w", encoding="utf-8") as fh:
+    fh.write(f"# {kind} bridges fetched automatically from Tor BridgeDB (moat)\n")
+    fh.write(f"# generated {datetime.datetime.now().isoformat(timespec='seconds')}\n")
+    fh.write("\n".join(out) + "\n")
+print(len(out))
+PYFETCH
+}
+
+if [ -n "$OBFS4PROXY" ]; then
+    info "Requesting obfs4 bridges from bridges.torproject.org…"
+    if fetch_kind obfs4 "$INSTALL_DIR/obfs4_bridges.txt"; then
+        ok "Saved $(grep -c '^Bridge ' "$INSTALL_DIR/obfs4_bridges.txt" 2>/dev/null || echo some) obfs4 bridges"
+    else
+        warn "Could not fetch obfs4 now — the app will retry on launch."
+    fi
+else
+    info "obfs4proxy not installed — skipping obfs4."
+fi
+
+if [ -n "$SNOWFLAKE_CLIENT" ]; then
+    info "Requesting snowflake bridges from bridges.torproject.org…"
+    if fetch_kind snowflake "$INSTALL_DIR/snowflake_bridges.txt"; then
+        ok "Saved $(grep -c '^Bridge ' "$INSTALL_DIR/snowflake_bridges.txt" 2>/dev/null || echo some) snowflake bridges"
+    else
+        warn "Could not fetch snowflake now — the built-in line will be used."
+    fi
+else
+    info "snowflake-client not installed — skipping snowflake."
+fi
+
 # ── Step 9 — Launcher script (auto privilege elevation) ──────────────────────
 header "Step 9 — Creating launcher"
 
