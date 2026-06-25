@@ -517,30 +517,45 @@ class TorManager:
         if not os.path.isfile(TORRC_PATH):
             raise FileNotFoundError(
                 f"torrc not found: {TORRC_PATH}\nRun install.sh to set it up.")
-        extra_args = []
-        if not os.access("/var/lib/tor", os.W_OK):
-            self._user_data_dir = os.path.expanduser(
-                "~/.local/share/torshield/tor-data")
+        # Always run Tor with its own writable DataDirectory + a real log file.
+        # Tor logs startup errors to STDOUT (not stderr), and refuses to use a
+        # DataDirectory owned by another user — both of which made the previous
+        # "(none)" / "exited immediately" failures impossible to diagnose. Using
+        # a per-user data dir and capturing the log fixes both.
+        self._user_data_dir = os.path.expanduser("~/.local/share/torshield/tor-data")
+        try:
             os.makedirs(self._user_data_dir, mode=0o700, exist_ok=True)
-            extra_args = ["--DataDirectory", self._user_data_dir]
-        cmd = [TOR_EXE_PATH, "-f", TORRC_PATH] + extra_args
+        except Exception:
+            self._user_data_dir = tempfile.mkdtemp(prefix="torshield-tor-")
+        self._log_path = os.path.join(self._user_data_dir, "tor.log")
+        cmd = [TOR_EXE_PATH, "-f", TORRC_PATH,
+               "--DataDirectory", self._user_data_dir,
+               "--Log", "notice stdout"]
+
+        # Send Tor's combined output to a file (so a full pipe can never block
+        # Tor, and we can read the real error on immediate exit).
+        self._log_fh = open(self._log_path, "w+b")
         self._process = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            cmd, stdout=self._log_fh, stderr=subprocess.STDOUT)
         try:
             self._process.wait(timeout=3)
-            stderr_out = ""
-            if self._process.stderr:
-                stderr_out = self._process.stderr.read().decode("utf-8", "replace")
+            out = ""
+            try:
+                self._log_fh.flush()
+                with open(self._log_path, "r", encoding="utf-8", errors="replace") as f:
+                    out = f.read().strip()
+            except Exception:
+                pass
             raise RuntimeError(
                 "Tor exited immediately after launch.\n\n"
                 "Common causes:\n"
-                "  • /etc/tor/torrc has a syntax error\n"
+                "  • another Tor is already running (sudo systemctl stop tor)\n"
+                "  • port 9050/9051/9040 already in use\n"
                 "  • a pluggable-transport binary is missing\n"
-                "  • DataDirectory not writable\n"
-                "  • Port 9050/9051/9040 already in use\n\n"
-                f"Tor output:\n{stderr_out[-800:] if stderr_out else '(none)'}")
+                "  • /etc/tor/torrc has a syntax error\n\n"
+                f"Tor said:\n{out[-1000:] if out else '(no output captured)'}")
         except subprocess.TimeoutExpired:
-            pass
+            pass   # still running after 3 s — good
         return True
 
     def stop_tor(self) -> None:
@@ -553,6 +568,13 @@ class TorManager:
             except subprocess.TimeoutExpired:
                 self._process.kill()
         self._process = None
+        fh = getattr(self, "_log_fh", None)
+        if fh:
+            try:
+                fh.close()
+            except Exception:
+                pass
+            self._log_fh = None
 
     def is_running(self) -> bool:
         return self._process is not None and self._process.poll() is None
