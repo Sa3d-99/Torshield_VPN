@@ -73,7 +73,32 @@ torshield-uninstall
 
 ---
 
-## Manual Installation
+## Windows
+
+TorShield also runs on Windows (the same Fluent GUI, Tor connection, bridges,
+circuits, exit-country, identity, IP test, and auto-update).
+
+```powershell
+# 1. Get Tor: download the Tor Expert Bundle from
+#    https://www.torproject.org/download/tor/  and put tor.exe
+#    (plus snowflake-client.exe / obfs4proxy.exe for bridges) in a "tor\" folder
+#    next to the project.
+# 2. Install Python deps + generate config + fetch bridges:
+python setup_windows.py
+# 3. Launch (right-click your terminal → "Run as administrator" for routing):
+python tor_vpn_gui.py
+```
+
+**Differences from Linux:**
+- Elevation uses the **UAC prompt** (instead of pkexec/sudo).
+- Config lives in `%APPDATA%\TorShield\` (torrc, bridges, data).
+- "Route all traffic" uses **WinDivert** (`pydivert`) to transparently send all
+  TCP through Tor — this is the experimental Windows equivalent of Linux's
+  iptables routing and requires Administrator. Everything else is identical.
+
+---
+
+## Manual Installation (Linux)
 
 ### 1 — Install system packages
 

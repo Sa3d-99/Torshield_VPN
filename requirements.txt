@@ -16,3 +16,6 @@ requests>=2.31.0,<3.0          # Connection test over the Tor SOCKS proxy
 PySocks>=1.7.1,<2.0            # SOCKS5 support for requests (socks5h://)
 fake-useragent>=1.5.1,<2.0     # Optional — User-Agent randomisation
 Pillow>=10.2.0,<12.0           # Logo image display in the header
+
+# ── Windows only (ignored on Linux via the platform marker) ──────────────────
+pydivert>=2.1.0; sys_platform == "win32"   # WinDivert bindings for all-TCP routing

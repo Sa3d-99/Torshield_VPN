@@ -42,14 +42,29 @@ except Exception:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Version + GitHub auto-update
+# Platform awareness (Linux + Windows)
 # ─────────────────────────────────────────────────────────────────────────────
+import platform
+
+IS_WINDOWS = os.name == "nt"
+IS_LINUX   = (os.name == "posix") and (platform.system() == "Linux")
+EXE = ".exe" if IS_WINDOWS else ""
+
+
+def app_data_dir() -> str:
+    """Per-user app directory for config, torrc, data — OS appropriate."""
+    if IS_WINDOWS:
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "TorShield")
+    return os.path.expanduser("~/.local/share/torshield")
+
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def _read_version() -> str:
     for path in (os.path.join(HERE, "VERSION"),
-                 os.path.expanduser("~/.local/share/torshield/VERSION")):
+                 os.path.join(app_data_dir(), "VERSION")):
         try:
             if os.path.isfile(path):
                 with open(path, encoding="utf-8") as fh:
@@ -72,7 +87,9 @@ REPO_RAW_VERSION_URL = (
 REPO_TARBALL_URL = (
     f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/archive/refs/heads/"
     f"{GITHUB_BRANCH}.tar.gz")
-INSTALL_DIR = os.path.expanduser("~/.local/share/torshield")
+# On Linux this is exactly the old path (~/.local/share/torshield) — unchanged.
+# On Windows it becomes %APPDATA%\TorShield.
+INSTALL_DIR = app_data_dir()
 
 
 def _parse_version(v: str) -> tuple:
@@ -136,9 +153,10 @@ def perform_update(log: Optional[Callable[[str, str], None]] = None) -> bool:
         src_root = roots[0]
 
         copied = 0
-        for name in ("tor_vpn_gui.py", "torshield_core.py", "VERSION",
-                     "torrc.template", "install.sh", "uninstall.sh",
-                     "requirements.txt", "Header_Logo.png", "torshield.png"):
+        for name in ("tor_vpn_gui.py", "torshield_core.py", "win_routing.py",
+                     "setup_windows.py", "VERSION", "torrc.template",
+                     "install.sh", "uninstall.sh", "requirements.txt",
+                     "Header_Logo.png", "torshield.png"):
             src = os.path.join(src_root, name)
             if os.path.isfile(src):
                 try:
@@ -203,13 +221,34 @@ def _load_conf() -> dict:
 
 _CONF = _load_conf()
 
-TOR_EXE_PATH     = _CONF.get("TOR_EXE") or _detect_bin(
-    "tor", "/usr/sbin/tor", "/usr/bin/tor", "/usr/local/bin/tor") or "/usr/sbin/tor"
-TORRC_PATH       = _CONF.get("TORRC_PATH") or "/etc/tor/torrc"
-SNOWFLAKE_CLIENT = _CONF.get("SNOWFLAKE_CLIENT") or _detect_bin(
-    "snowflake-client", "/usr/bin/snowflake-client")
-OBFS4PROXY       = _CONF.get("OBFS4PROXY") or _detect_bin(
-    "obfs4proxy", "/usr/bin/obfs4proxy", "/usr/lib/tor/obfs4proxy")
+if IS_WINDOWS:
+    # Common Tor Expert Bundle / Tor Browser install locations on Windows, plus
+    # a bundled "tor\" folder next to the app. Falls back to bare names on PATH.
+    _pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    _lad = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+    _win_tor = [
+        os.path.join(HERE, "tor", "tor.exe"),
+        os.path.join(INSTALL_DIR, "tor", "tor.exe"),
+        os.path.join(_pf, "Tor", "tor.exe"),
+        os.path.join(_lad, r"Tor Browser\Browser\TorBrowser\Tor\tor.exe"),
+    ]
+    _win_sf = [os.path.join(HERE, "tor", "snowflake-client.exe"),
+               os.path.join(_pf, "Tor", "snowflake-client.exe")]
+    _win_ob = [os.path.join(HERE, "tor", "obfs4proxy.exe"),
+               os.path.join(_pf, "Tor", "obfs4proxy.exe")]
+    TOR_EXE_PATH     = _CONF.get("TOR_EXE") or _detect_bin("tor", *_win_tor) or "tor.exe"
+    TORRC_PATH       = _CONF.get("TORRC_PATH") or os.path.join(INSTALL_DIR, "torrc")
+    SNOWFLAKE_CLIENT = _CONF.get("SNOWFLAKE_CLIENT") or _detect_bin("snowflake-client", *_win_sf)
+    OBFS4PROXY       = _CONF.get("OBFS4PROXY") or _detect_bin("obfs4proxy", *_win_ob)
+else:
+    # ── Linux: unchanged ──
+    TOR_EXE_PATH     = _CONF.get("TOR_EXE") or _detect_bin(
+        "tor", "/usr/sbin/tor", "/usr/bin/tor", "/usr/local/bin/tor") or "/usr/sbin/tor"
+    TORRC_PATH       = _CONF.get("TORRC_PATH") or "/etc/tor/torrc"
+    SNOWFLAKE_CLIENT = _CONF.get("SNOWFLAKE_CLIENT") or _detect_bin(
+        "snowflake-client", "/usr/bin/snowflake-client")
+    OBFS4PROXY       = _CONF.get("OBFS4PROXY") or _detect_bin(
+        "obfs4proxy", "/usr/bin/obfs4proxy", "/usr/lib/tor/obfs4proxy")
 
 CONTROL_PASSWORD = ""
 SOCKS_PORT   = 9050
@@ -268,15 +307,37 @@ def ts() -> str:
 
 
 def check_root() -> bool:
+    """Admin/root check — Windows uses IsUserAnAdmin, Linux uses geteuid()."""
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
     return os.geteuid() == 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Privilege elevation (pkexec → sudo → unprivileged)
+# Privilege elevation — Windows UAC (runas) / Linux pkexec → sudo → unprivileged
 # ─────────────────────────────────────────────────────────────────────────────
 def ensure_root() -> None:
-    if os.geteuid() == 0:
+    if check_root():
         return
+
+    if IS_WINDOWS:
+        # Re-launch the app elevated through the UAC prompt (ShellExecute runas).
+        try:
+            import ctypes
+            params = " ".join(f'"{a}"' for a in sys.argv)
+            rc = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", sys.executable, params, None, 1)
+            if rc > 32:          # success → the elevated instance takes over
+                sys.exit()
+        except Exception:
+            pass
+        return                   # user declined → keep running unprivileged
+
+    # ── Linux: unchanged (pkexec → sudo handled by the launcher) ──
     display = os.environ.get("DISPLAY", ":0")
     xauth   = os.environ.get("XAUTHORITY", "")
     wayland = os.environ.get("WAYLAND_DISPLAY", "")
@@ -427,8 +488,48 @@ def build_bridge_block(mode: str) -> str:
     return "\n".join(body) + "\n"
 
 
+def ensure_torrc() -> None:
+    """
+    Generate a default torrc at TORRC_PATH if it doesn't exist. Used on Windows
+    (no install.sh). On Linux the installer writes /etc/tor/torrc, so this is a
+    no-op there unless the file is somehow missing.
+    """
+    if os.path.isfile(TORRC_PATH):
+        return
+    try:
+        os.makedirs(os.path.dirname(TORRC_PATH) or ".", exist_ok=True)
+    except Exception:
+        pass
+    lines = [
+        "# TorShield torrc — auto-generated",
+        f"SocksPort {SOCKS_PORT}",
+        f"ControlPort {CONTROL_PORT}",
+        "CookieAuthentication 1",
+    ]
+    if not IS_WINDOWS:
+        # TransPort/DNSPort transparent proxying is Linux-only.
+        lines += [f"TransPort {TRANS_PORT}", f"DNSPort {DNS_PORT}",
+                  "AutomapHostsOnResolve 1", "CookieAuthFileGroupReadable 1"]
+    if SNOWFLAKE_CLIENT:
+        lines.append(
+            f'ClientTransportPlugin snowflake exec "{SNOWFLAKE_CLIENT}" '
+            "-url https://snowflake-broker.torproject.net/ -front foursquare.com "
+            "-ice stun:stun.l.google.com:19302,stun:stun.antisip.com:3478")
+    if OBFS4PROXY:
+        lines.append(f'ClientTransportPlugin obfs4 exec "{OBFS4PROXY}"')
+    lines.append(build_bridge_block("Direct").rstrip("\n"))
+    try:
+        with open(TORRC_PATH, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+    except Exception:
+        pass
+
+
 def apply_bridge_mode(mode: str) -> None:
     block = build_bridge_block(mode)
+    # On Windows the torrc is app-generated (no install.sh) — create it first.
+    if IS_WINDOWS and not os.path.isfile(TORRC_PATH):
+        ensure_torrc()
     try:
         with open(TORRC_PATH, encoding="utf-8") as fh:
             content = fh.read()
@@ -460,6 +561,15 @@ def _run(cmd: list) -> bool:
 
 
 def enable_system_routing() -> tuple:
+    # Windows: transparent all-TCP routing via WinDivert (separate module).
+    if IS_WINDOWS:
+        try:
+            import win_routing
+            return win_routing.enable(SOCKS_PORT)
+        except Exception as exc:
+            return False, f"WinDivert routing error: {exc}"
+
+    # ── Linux: unchanged (iptables transparent proxy) ──
     try:
         try:
             subprocess.run(["conntrack", "-F"],
@@ -490,6 +600,14 @@ def enable_system_routing() -> tuple:
 
 
 def disable_system_routing() -> tuple:
+    if IS_WINDOWS:
+        try:
+            import win_routing
+            return win_routing.disable()
+        except Exception as exc:
+            return False, f"WinDivert restore error: {exc}"
+
+    # ── Linux: unchanged ──
     try:
         _run(["iptables", "-D", "OUTPUT", "-p", "udp", "--dport", "443", "-j", "REJECT"])
         _run(["iptables", "-D", "OUTPUT", "-p", "udp", "--dport", "80",  "-j", "REJECT"])
@@ -511,20 +629,26 @@ class TorManager:
         self._user_data_dir: Optional[str] = None
 
     def start_tor(self) -> bool:
-        if not os.path.isfile(TOR_EXE_PATH):
-            raise FileNotFoundError(
-                f"Tor binary not found: {TOR_EXE_PATH}\nRun: sudo apt-get install tor")
+        if not os.path.isfile(TOR_EXE_PATH) and not shutil.which(TOR_EXE_PATH):
+            hint = ("Install the Tor Expert Bundle and put tor.exe in a 'tor' folder "
+                    "next to the app." if IS_WINDOWS else "Run: sudo apt-get install tor")
+            raise FileNotFoundError(f"Tor binary not found: {TOR_EXE_PATH}\n{hint}")
+        # Windows has no install.sh, so generate a torrc on first run if missing.
         if not os.path.isfile(TORRC_PATH):
-            raise FileNotFoundError(
-                f"torrc not found: {TORRC_PATH}\nRun install.sh to set it up.")
+            if IS_WINDOWS:
+                ensure_torrc()
+            if not os.path.isfile(TORRC_PATH):
+                raise FileNotFoundError(
+                    f"torrc not found: {TORRC_PATH}\n"
+                    + ("(could not auto-generate it)" if IS_WINDOWS
+                       else "Run install.sh to set it up."))
+
         # Always run Tor with its own writable DataDirectory + a real log file.
-        # Tor logs startup errors to STDOUT (not stderr), and refuses to use a
-        # DataDirectory owned by another user — both of which made the previous
-        # "(none)" / "exited immediately" failures impossible to diagnose. Using
-        # a per-user data dir and capturing the log fixes both.
-        self._user_data_dir = os.path.expanduser("~/.local/share/torshield/tor-data")
+        self._user_data_dir = os.path.join(INSTALL_DIR, "tor-data")
         try:
-            os.makedirs(self._user_data_dir, mode=0o700, exist_ok=True)
+            os.makedirs(self._user_data_dir, exist_ok=True)
+            if not IS_WINDOWS:
+                os.chmod(self._user_data_dir, 0o700)
         except Exception:
             self._user_data_dir = tempfile.mkdtemp(prefix="torshield-tor-")
         self._log_path = os.path.join(self._user_data_dir, "tor.log")
@@ -535,8 +659,12 @@ class TorManager:
         # Send Tor's combined output to a file (so a full pipe can never block
         # Tor, and we can read the real error on immediate exit).
         self._log_fh = open(self._log_path, "w+b")
+        # On Windows, don't pop up a console window for tor.exe.
+        _popen_kw = {}
+        if IS_WINDOWS:
+            _popen_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         self._process = subprocess.Popen(
-            cmd, stdout=self._log_fh, stderr=subprocess.STDOUT)
+            cmd, stdout=self._log_fh, stderr=subprocess.STDOUT, **_popen_kw)
         try:
             self._process.wait(timeout=3)
             out = ""

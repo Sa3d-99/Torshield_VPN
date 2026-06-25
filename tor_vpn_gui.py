@@ -833,10 +833,15 @@ class TorShieldWindow(QWidget):
 
     def _auto_route(self):
         self.log("Routing ALL system traffic through Tor…", "accent")
-        self.log("  • flushing conntrack (prevents pre-Tor leaks)", "dim")
-        self.log("  • redirecting TCP → Tor TransPort 9040", "dim")
-        self.log("  • redirecting DNS → Tor DNSPort 5353", "dim")
-        self.log("  • blocking QUIC (UDP 443/80)", "dim")
+        if core.IS_WINDOWS:
+            self.log("  • loading WinDivert kernel driver", "dim")
+            self.log("  • redirecting outbound TCP → Tor SOCKS", "dim")
+            self.log("  • DNS resolved through Tor (socks5h)", "dim")
+        else:
+            self.log("  • flushing conntrack (prevents pre-Tor leaks)", "dim")
+            self.log("  • redirecting TCP → Tor TransPort 9040", "dim")
+            self.log("  • redirecting DNS → Tor DNSPort 5353", "dim")
+            self.log("  • blocking QUIC (UDP 443/80)", "dim")
         ok, msg = core.enable_system_routing()
         self._routing_active = ok
         self.log(msg, "ok" if ok else "error")
