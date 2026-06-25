@@ -304,19 +304,39 @@ fi
 # ── Step 7 — Python packages (pinned, reproducible) ──────────────────────────
 header "Step 7 — Python packages"
 
-PIP_FLAGS=(--quiet --upgrade)
-# Newer pip on Debian needs this to install outside a venv.
+# Install into the user site (~/.local): isolated, no system conflicts, and it
+# matches what the app's root-bootstrap looks for. We do NOT upgrade pip itself
+# (that step fails on externally-managed Kali and isn't needed) and we never let
+# a pip hiccup abort the whole installer — we verify the imports at the end,
+# which is what actually matters.
+PIP_FLAGS=(--user --upgrade)
 if pip install --help 2>/dev/null | grep -q -- "--break-system-packages"; then
     PIP_FLAGS+=(--break-system-packages)
 fi
 
-pip install "${PIP_FLAGS[@]}" pip
+PKG_LOG="$(mktemp)"
+info "Installing Python packages into ~/.local (this can take a minute)…"
 if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
-    pip install "${PIP_FLAGS[@]}" -r "$SCRIPT_DIR/requirements.txt"
-    ok "Python packages installed from requirements.txt (pinned versions)"
+    if pip install "${PIP_FLAGS[@]}" -r "$SCRIPT_DIR/requirements.txt" >"$PKG_LOG" 2>&1; then
+        ok "Python packages installed from requirements.txt"
+    else
+        warn "pip reported an issue — last lines below; trying packages individually…"
+        tail -n 12 "$PKG_LOG"
+        pip install "${PIP_FLAGS[@]}" PyQt5 PyQt-Fluent-Widgets stem requests \
+            PySocks fake-useragent Pillow >>"$PKG_LOG" 2>&1 || true
+    fi
 else
-    pip install "${PIP_FLAGS[@]}" customtkinter stem requests PySocks fake-useragent pillow
-    ok "Python packages installed"
+    pip install "${PIP_FLAGS[@]}" PyQt5 PyQt-Fluent-Widgets stem requests \
+        PySocks fake-useragent Pillow >"$PKG_LOG" 2>&1 || true
+fi
+rm -f "$PKG_LOG"
+
+# The real success check: can Python import the critical modules?
+if python3 -c "import qfluentwidgets, stem, requests, socks" 2>/dev/null; then
+    ok "Verified: qfluentwidgets, stem, requests, PySocks all import"
+else
+    warn "Some Python deps did not import. Fix manually with:"
+    warn "  pip install --user PyQt-Fluent-Widgets stem requests PySocks fake-useragent Pillow ${PIP_BSP[*]}"
 fi
 
 # ── Step 8 — Copy TorShield files ────────────────────────────────────────────
