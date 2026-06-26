@@ -328,6 +328,7 @@ torshield/
 ├── win_routing.py       # Windows-only — TUN VPN (tun2socks) + system-proxy fallback
 ├── setup_windows.py     # Windows one-time setup (installs Python deps)
 ├── reset_internet.bat   # Windows emergency: restore internet if ever stuck
+├── uninstall_windows.bat# Windows uninstaller: restore network + remove all data
 ├── build_exe.bat        # Windows — build TorShield.exe with Nuitka (one command)
 ├── TorShield.spec       # Windows — PyInstaller spec (alternative build)
 ├── TorShield.iss        # Windows — Inno Setup script → TorShield-Setup.exe installer

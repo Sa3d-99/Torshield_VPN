@@ -48,11 +48,12 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"
 
 [Files]
-Source: "TorShield.exe";        DestDir: "{app}"; Flags: ignoreversion
-Source: "reset_internet.bat";   DestDir: "{app}"; Flags: ignoreversion
-Source: "torshield.ico";        DestDir: "{app}"; Flags: ignoreversion
+Source: "TorShield.exe";          DestDir: "{app}"; Flags: ignoreversion
+Source: "reset_internet.bat";     DestDir: "{app}"; Flags: ignoreversion
+Source: "uninstall_windows.bat";  DestDir: "{app}"; Flags: ignoreversion
+Source: "torshield.ico";          DestDir: "{app}"; Flags: ignoreversion
 ; README is handy to ship alongside (optional)
-Source: "README.md";            DestDir: "{app}"; Flags: ignoreversion isreadme
+Source: "README.md";              DestDir: "{app}"; Flags: ignoreversion isreadme
 
 [Icons]
 Name: "{group}\{#MyAppName}";                       Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\torshield.ico"
@@ -66,3 +67,8 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName} now"; Flags
 [UninstallRun]
 ; On uninstall, make sure routing/DNS is fully restored and nothing is left running.
 Filename: "{cmd}"; Parameters: "/c taskkill /F /IM TorShield.exe & taskkill /F /IM tun2socks.exe & taskkill /F /IM tor.exe & route delete 0.0.0.0 mask 0.0.0.0 10.7.0.1 & ipconfig /flushdns"; Flags: runhidden; RunOnceId: "TorShieldCleanup"
+
+[UninstallDelete]
+; Remove the downloaded Tor + helpers + config so nothing is left behind.
+Type: filesandordirs; Name: "{userappdata}\TorShield"
+Type: filesandordirs; Name: "{localappdata}\TorShield"
