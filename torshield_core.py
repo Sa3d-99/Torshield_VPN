@@ -59,7 +59,12 @@ def app_data_dir() -> str:
     return os.path.expanduser("~/.local/share/torshield")
 
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# When frozen by PyInstaller, bundled data (logos, VERSION) lives in the temporary
+# extraction dir (sys._MEIPASS); from source it's the script's folder.
+if getattr(sys, "frozen", False):
+    HERE = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
+else:
+    HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def _read_version() -> str:
@@ -221,25 +226,115 @@ def _load_conf() -> dict:
 
 _CONF = _load_conf()
 
+# GeoIP databases — only used on Windows (Linux's tor finds the system geoip on
+# its own, so these stay empty there and the Linux torrc/launch are unchanged).
+GEOIP_FILE = ""
+GEOIP6_FILE = ""
+
 if IS_WINDOWS:
-    # Common Tor Expert Bundle / Tor Browser install locations on Windows, plus
-    # a bundled "tor\" folder next to the app. Falls back to bare names on PATH.
+    # Locate Tor at runtime instead of hard-coding a path, so the app works on any
+    # machine wherever Tor Browser happens to be installed. We probe a "Tor"
+    # directory (…\Browser\TorBrowser\Tor) under common roots — every fixed drive,
+    # the user's Desktop/Downloads/home, Program Files and LocalAppData — and
+    # accept either the spaced "Tor Browser" or an underscored "Tor_browser" name.
     _pf = os.environ.get("ProgramFiles", r"C:\Program Files")
-    _lad = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
-    _win_tor = [
-        os.path.join(HERE, "tor", "tor.exe"),
-        os.path.join(INSTALL_DIR, "tor", "tor.exe"),
-        os.path.join(_pf, "Tor", "tor.exe"),
-        os.path.join(_lad, r"Tor Browser\Browser\TorBrowser\Tor\tor.exe"),
-    ]
-    _win_sf = [os.path.join(HERE, "tor", "snowflake-client.exe"),
-               os.path.join(_pf, "Tor", "snowflake-client.exe")]
-    _win_ob = [os.path.join(HERE, "tor", "obfs4proxy.exe"),
-               os.path.join(_pf, "Tor", "obfs4proxy.exe")]
-    TOR_EXE_PATH     = _CONF.get("TOR_EXE") or _detect_bin("tor", *_win_tor) or "tor.exe"
-    TORRC_PATH       = _CONF.get("TORRC_PATH") or os.path.join(INSTALL_DIR, "torrc")
-    SNOWFLAKE_CLIENT = _CONF.get("SNOWFLAKE_CLIENT") or _detect_bin("snowflake-client", *_win_sf)
-    OBFS4PROXY       = _CONF.get("OBFS4PROXY") or _detect_bin("obfs4proxy", *_win_ob)
+
+    def _win_tor_dirs():
+        sub = os.path.join("Browser", "TorBrowser", "Tor")
+        names = ("Tor Browser", "Tor_browser", "tor-browser", "TorBrowser")
+        home = os.path.expanduser("~")
+        bases = [home,
+                 os.path.join(home, "Desktop"),
+                 os.path.join(home, "Downloads"),
+                 os.environ.get("LOCALAPPDATA", ""),
+                 os.environ.get("ProgramFiles", ""),
+                 os.environ.get("ProgramFiles(x86)", "")]
+        import string
+        for letter in string.ascii_uppercase:
+            root = letter + ":\\"
+            if os.path.isdir(root):
+                bases.append(root)
+        seen = set()
+        for base in bases:
+            if not base:
+                continue
+            for name in names:
+                d = os.path.join(base, name, sub)
+                if d not in seen:
+                    seen.add(d)
+                    yield d
+
+    def _find_in_tor_browser(rel):
+        for d in _win_tor_dirs():
+            p = os.path.join(d, rel)
+            if os.path.isfile(p):
+                return p
+        return ""
+
+    # Where ensure_tor_installed() drops the downloaded Tor Expert Bundle. The
+    # tarball keeps its own  tor/  and  data/  folders, so after extraction we get
+    # TEB_DIR/tor/tor.exe, TEB_DIR/tor/pluggable_transports/lyrebird.exe and
+    # TEB_DIR/data/geoip.  INSTALL_DIR (%APPDATA%\TorShield) is space-free & writable.
+    TEB_DIR = os.path.join(INSTALL_DIR, "tor")
+    _eb_tor      = os.path.join(TEB_DIR, "tor", "tor.exe")
+    _eb_lyrebird = os.path.join(TEB_DIR, "tor", "pluggable_transports", "lyrebird.exe")
+
+    def _find_geoip_near(tor_exe):
+        """Locate the geoip / geoip6 databases that ship with a tor.exe. Expert
+        Bundle keeps them in  ../data , Tor Browser in  ../Data/Tor ."""
+        if not tor_exe:
+            return "", ""
+        d = os.path.dirname(tor_exe)
+        for g, g6 in (
+            (os.path.join(d, "..", "data", "geoip"),
+             os.path.join(d, "..", "data", "geoip6")),         # Expert Bundle
+            (os.path.join(d, "..", "Data", "Tor", "geoip"),
+             os.path.join(d, "..", "Data", "Tor", "geoip6")),  # Tor Browser
+            (os.path.join(d, "geoip"), os.path.join(d, "geoip6")),
+            (os.path.join(TEB_DIR, "data", "geoip"),
+             os.path.join(TEB_DIR, "data", "geoip6")),
+        ):
+            if os.path.isfile(g):
+                return (os.path.normpath(g),
+                        os.path.normpath(g6) if os.path.isfile(g6) else "")
+        return "", ""
+
+    def _resolve_windows_bins():
+        """(Re)detect Tor + transports + geoip and publish them as module globals.
+        Called at import and again after ensure_tor_installed() downloads Tor."""
+        global TOR_EXE_PATH, TORRC_PATH, SNOWFLAKE_CLIENT, OBFS4PROXY
+        global GEOIP_FILE, GEOIP6_FILE
+        _tb_tor = _find_in_tor_browser("tor.exe")
+        # Tor Browser ships lyrebird, which provides BOTH the obfs4 and snowflake
+        # transports (replacing the old separate obfs4proxy / snowflake-client).
+        _tb_lyrebird = _find_in_tor_browser(
+            os.path.join("PluggableTransports", "lyrebird.exe"))
+
+        # Order: a "tor\" folder bundled next to the app wins (portable installs),
+        # then our downloaded Expert Bundle, then a detected Tor Browser, then a
+        # Tor Expert Bundle installed in Program Files.
+        _win_tor = [os.path.join(HERE, "tor", "tor.exe"), _eb_tor]
+        if _tb_tor:
+            _win_tor.append(_tb_tor)
+        _win_tor.append(os.path.join(_pf, "Tor", "tor.exe"))
+
+        _win_sf = [os.path.join(HERE, "tor", "snowflake-client.exe"), _eb_lyrebird]
+        _win_ob = [os.path.join(HERE, "tor", "obfs4proxy.exe"), _eb_lyrebird]
+        if _tb_lyrebird:
+            _win_sf.append(_tb_lyrebird)
+            _win_ob.append(_tb_lyrebird)
+        _win_sf.append(os.path.join(_pf, "Tor", "snowflake-client.exe"))
+        _win_ob.append(os.path.join(_pf, "Tor", "obfs4proxy.exe"))
+
+        TOR_EXE_PATH     = _CONF.get("TOR_EXE") or _detect_bin("tor", *_win_tor) or "tor.exe"
+        TORRC_PATH       = _CONF.get("TORRC_PATH") or os.path.join(INSTALL_DIR, "torrc")
+        SNOWFLAKE_CLIENT = _CONF.get("SNOWFLAKE_CLIENT") or _detect_bin("snowflake-client", *_win_sf)
+        OBFS4PROXY       = _CONF.get("OBFS4PROXY") or _detect_bin("obfs4proxy", *_win_ob)
+        g, g6 = _find_geoip_near(TOR_EXE_PATH)
+        GEOIP_FILE  = _CONF.get("GEOIP_FILE")  or g
+        GEOIP6_FILE = _CONF.get("GEOIP6_FILE") or g6
+
+    _resolve_windows_bins()
 else:
     # ── Linux: unchanged ──
     TOR_EXE_PATH     = _CONF.get("TOR_EXE") or _detect_bin(
@@ -256,6 +351,13 @@ TRANS_PORT   = 9040
 DNS_PORT     = 5353
 CONTROL_PORT = 9051
 CONTROL_HOST = "127.0.0.1"
+# Tor's built-in HTTP CONNECT proxy. Browsers honor an HTTP/HTTPS system proxy far
+# more reliably than a SOCKS one, so on Windows we point the system proxy here and
+# Tor tunnels it onward. Only used on Windows (see _win_tor_extra_args).
+HTTP_TUNNEL_PORT = 9080
+# Tor's DNS resolver port (Windows). The TUN VPN forwards DNS here so names resolve
+# through Tor with no leak; harmless in proxy mode.
+TOR_DNS_PORT = 9053
 
 OBFS4_BRIDGES_FILE     = os.path.join(INSTALL_DIR, "obfs4_bridges.txt")
 SNOWFLAKE_BRIDGES_FILE = os.path.join(INSTALL_DIR, "snowflake_bridges.txt")
@@ -321,21 +423,30 @@ def check_root() -> bool:
 # Privilege elevation — Windows UAC (runas) / Linux pkexec → sudo → unprivileged
 # ─────────────────────────────────────────────────────────────────────────────
 def ensure_root() -> None:
-    if check_root():
-        return
-
     if IS_WINDOWS:
-        # Re-launch the app elevated through the UAC prompt (ShellExecute runas).
+        # The TUN VPN (route every app) needs administrator rights to create the
+        # virtual adapter and edit the routing table, so elevate via UAC. If the
+        # user declines, the app still runs and falls back to the per-user system
+        # proxy (which is SID-aware and works whether elevated or not).
+        if check_root():
+            return
         try:
             import ctypes
-            params = " ".join(f'"{a}"' for a in sys.argv)
+            # Built exe (PyInstaller/Nuitka): sys.executable IS the app, so pass only
+            # argv[1:]. From source: sys.executable is python(w), so pass script+args.
+            _is_exe = getattr(sys, "frozen", False) or "__compiled__" in globals()
+            rest = sys.argv[1:] if _is_exe else sys.argv
+            params = " ".join(f'"{a}"' for a in rest)
             rc = ctypes.windll.shell32.ShellExecuteW(
                 None, "runas", sys.executable, params, None, 1)
             if rc > 32:          # success → the elevated instance takes over
                 sys.exit()
         except Exception:
             pass
-        return                   # user declined → keep running unprivileged
+        return                   # declined → keep running, proxy fallback applies
+
+    if check_root():
+        return
 
     # ── Linux: unchanged (pkexec → sudo handled by the launcher) ──
     display = os.environ.get("DISPLAY", ":0")
@@ -488,6 +599,154 @@ def build_bridge_block(mode: str) -> str:
     return "\n".join(body) + "\n"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Windows: self-contained Tor install (no Tor Browser required)
+# ─────────────────────────────────────────────────────────────────────────────
+# A baked-in fallback used only if the live version lookup fails. Kept current-ish.
+TEB_FALLBACK_VERSION = "15.0.16"
+
+
+def _teb_latest_version() -> str:
+    """Latest Tor Browser / Expert-Bundle version, or the baked-in fallback."""
+    if _REQUESTS:
+        try:
+            r = requests.get(
+                "https://aus1.torproject.org/torbrowser/update_3/release/downloads.json",
+                timeout=20)
+            v = (r.json() or {}).get("version")
+            if v:
+                return str(v)
+        except Exception:
+            pass
+    return TEB_FALLBACK_VERSION
+
+
+def _teb_url(version: str) -> str:
+    return ("https://archive.torproject.org/tor-package-archive/torbrowser/"
+            f"{version}/tor-expert-bundle-windows-x86_64-{version}.tar.gz")
+
+
+def ensure_tor_installed(log: Optional[Callable] = None, force: bool = False) -> str:
+    """
+    Windows only: guarantee a usable tor.exe (plus lyrebird transports and the
+    geoip databases) without requiring Tor Browser, by downloading the official
+    Tor Expert Bundle into %APPDATA%\\TorShield\\tor on first run.
+
+    No-op on Linux, and a no-op on Windows when Tor is already present (bundled
+    next to the app, a previous download, Tor Browser, or a Program Files Expert
+    Bundle). Returns the resolved tor.exe path. `log(msg)` receives progress.
+    """
+    def _say(msg):
+        if log:
+            try:
+                log(msg)
+            except Exception:
+                pass
+
+    if not IS_WINDOWS:
+        return TOR_EXE_PATH
+    if not force and (os.path.isfile(TOR_EXE_PATH) or shutil.which(TOR_EXE_PATH)):
+        return TOR_EXE_PATH
+    if not _REQUESTS:
+        _say("Cannot download Tor: the 'requests' package is missing.")
+        return TOR_EXE_PATH
+
+    version = _teb_latest_version()
+    url = _teb_url(version)
+    os.makedirs(TEB_DIR, exist_ok=True)
+    tmp = os.path.join(tempfile.gettempdir(), f"tor-expert-bundle-{version}.tar.gz")
+    _say(f"Downloading Tor {version} (~22 MB)… one-time setup.")
+    try:
+        with requests.get(url, stream=True, timeout=300) as r:
+            r.raise_for_status()
+            total = int(r.headers.get("Content-Length", 0) or 0)
+            done = next_mark = 0
+            with open(tmp, "wb") as fh:
+                for chunk in r.iter_content(chunk_size=262144):
+                    if not chunk:
+                        continue
+                    fh.write(chunk)
+                    done += len(chunk)
+                    if total and done >= next_mark:
+                        _say(f"  …{done * 100 // total}%")
+                        next_mark += total // 10
+        _say("Extracting Tor…")
+        with tarfile.open(tmp) as tf:
+            members = [m for m in tf.getmembers()
+                       if m.name.startswith(("tor/", "data/"))]
+            try:
+                tf.extractall(TEB_DIR, members=members, filter="data")
+            except TypeError:        # Python < 3.12 has no 'filter' kwarg
+                tf.extractall(TEB_DIR, members=members)
+    except Exception as exc:
+        _say(f"Tor download failed: {exc}")
+        return TOR_EXE_PATH
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+    _resolve_windows_bins()          # re-detect now that the files exist
+    _say(f"Tor ready: {TOR_EXE_PATH}")
+    return TOR_EXE_PATH
+
+
+def _pt_exec_path(path: str) -> str:
+    """
+    Windows-only: make a pluggable-transport binary usable from a torrc
+    ClientTransportPlugin 'exec' line. Tor splits that line on whitespace and
+    keeps quotes literally, so a binary whose path contains a space (e.g. Tor
+    Browser under 'F:\\Tor browser\\...') can never launch — tor only sees
+    '"F:\\Tor'. When the path has a space we copy the (standalone) PT binary into
+    the space-free INSTALL_DIR and return that copy. No-op on Linux and for
+    already space-free paths.
+    """
+    if not IS_WINDOWS or not path or " " not in path:
+        return path
+    try:
+        os.makedirs(INSTALL_DIR, exist_ok=True)
+        dst = os.path.join(INSTALL_DIR, os.path.basename(path))
+        if (not os.path.isfile(dst)
+                or os.path.getsize(dst) != os.path.getsize(path)):
+            shutil.copy2(path, dst)
+        if " " not in dst:
+            return dst
+    except Exception:
+        pass
+    return path
+
+
+def _win_tor_extra_args() -> list:
+    """
+    Windows-only extra tor command-line args: the pluggable-transport plugins and
+    the geoip databases. Passing them here (instead of in the torrc) keeps the
+    paths current and lets tor's argv parser receive each value as one token, so
+    geoip paths with spaces are fine. Transport exec paths still go through
+    _pt_exec_path so they are space-free (tor's PT sub-parser splits on spaces).
+    Returns [] on Linux.
+    """
+    if not IS_WINDOWS:
+        return []
+    # An HTTP CONNECT proxy that tunnels through Tor — the Windows system proxy
+    # points browsers at this (HTTP proxies are honored far more reliably than
+    # SOCKS), so traffic actually exits via Tor and the IP changes.
+    args = ["--HTTPTunnelPort", str(HTTP_TUNNEL_PORT),
+            "--DNSPort", f"127.0.0.1:{TOR_DNS_PORT}"]
+    if SNOWFLAKE_CLIENT:
+        # lyrebird provides snowflake and reads url/front/ice from the bridge line.
+        args += ["--ClientTransportPlugin",
+                 f"snowflake exec {_pt_exec_path(SNOWFLAKE_CLIENT)}"]
+    if OBFS4PROXY:
+        args += ["--ClientTransportPlugin",
+                 f"obfs4 exec {_pt_exec_path(OBFS4PROXY)}"]
+    if GEOIP_FILE:
+        args += ["--GeoIPFile", GEOIP_FILE]
+        if GEOIP6_FILE:
+            args += ["--GeoIPv6File", GEOIP6_FILE]
+    return args
+
+
 def ensure_torrc() -> None:
     """
     Generate a default torrc at TORRC_PATH if it doesn't exist. Used on Windows
@@ -510,13 +769,18 @@ def ensure_torrc() -> None:
         # TransPort/DNSPort transparent proxying is Linux-only.
         lines += [f"TransPort {TRANS_PORT}", f"DNSPort {DNS_PORT}",
                   "AutomapHostsOnResolve 1", "CookieAuthFileGroupReadable 1"]
-    if SNOWFLAKE_CLIENT:
-        lines.append(
-            f'ClientTransportPlugin snowflake exec "{SNOWFLAKE_CLIENT}" '
-            "-url https://snowflake-broker.torproject.net/ -front foursquare.com "
-            "-ice stun:stun.l.google.com:19302,stun:stun.antisip.com:3478")
-    if OBFS4PROXY:
-        lines.append(f'ClientTransportPlugin obfs4 exec "{OBFS4PROXY}"')
+    # On Windows the ClientTransportPlugin lines (and GeoIPFile) are passed on the
+    # tor command line instead — see TorManager.start_tor / _win_tor_extra_args —
+    # so the exec paths stay current even if Tor is re-detected or re-downloaded.
+    # Linux keeps writing them into the torrc exactly as before.
+    if not IS_WINDOWS:
+        if SNOWFLAKE_CLIENT:
+            lines.append(
+                f'ClientTransportPlugin snowflake exec "{SNOWFLAKE_CLIENT}" '
+                "-url https://snowflake-broker.torproject.net/ -front foursquare.com "
+                "-ice stun:stun.l.google.com:19302,stun:stun.antisip.com:3478")
+        if OBFS4PROXY:
+            lines.append(f'ClientTransportPlugin obfs4 exec "{OBFS4PROXY}"')
     lines.append(build_bridge_block("Direct").rstrip("\n"))
     try:
         with open(TORRC_PATH, "w", encoding="utf-8") as fh:
@@ -535,6 +799,14 @@ def apply_bridge_mode(mode: str) -> None:
             content = fh.read()
     except Exception as exc:
         raise RuntimeError(f"Cannot read {TORRC_PATH}: {exc}")
+    if IS_WINDOWS:
+        # Transports + geoip now go on tor's command line (see _win_tor_extra_args),
+        # so strip any ClientTransportPlugin/GeoIP* lines an older torrc may still
+        # carry — otherwise tor errors with "transport already registered".
+        content = "\n".join(
+            ln for ln in content.splitlines()
+            if not ln.lstrip().startswith(
+                ("ClientTransportPlugin", "GeoIPFile", "GeoIPv6File")))
     pattern = re.compile(re.escape(_BRIDGE_HEAD) + r".*?" + re.escape(_BRIDGE_TAIL),
                          re.DOTALL)
     if pattern.search(content):
@@ -560,14 +832,18 @@ def _run(cmd: list) -> bool:
         return False
 
 
-def enable_system_routing() -> tuple:
-    # Windows: transparent all-TCP routing via WinDivert (separate module).
+def enable_system_routing(tor_pid=None, log=None) -> tuple:
+    # Windows: full TUN VPN (all apps) with a system-proxy fallback (win_routing).
+    # tor_pid lets it route Tor's own traffic around the tunnel. Linux ignores the
+    # extra arguments and behaves exactly as before.
     if IS_WINDOWS:
         try:
             import win_routing
-            return win_routing.enable(SOCKS_PORT)
+            return win_routing.enable(SOCKS_PORT, tor_pid=tor_pid,
+                                      http_port=HTTP_TUNNEL_PORT,
+                                      tor_dns_port=TOR_DNS_PORT, log=log)
         except Exception as exc:
-            return False, f"WinDivert routing error: {exc}"
+            return False, f"Windows routing error: {exc}"
 
     # ── Linux: unchanged (iptables transparent proxy) ──
     try:
@@ -599,13 +875,60 @@ def enable_system_routing() -> tuple:
         return False, f"iptables error: {exc}"
 
 
+def cleanup_stale_routing(kill_tor: bool = False) -> None:
+    """Windows: quietly repair leftover TUN/DNS state from a previous crash (same as
+    reset_internet.bat, automatic) — at startup (self-heal) and before each connect
+    (clean slate). `kill_tor` also frees a stray tor.exe holding the ports. No-op on
+    Linux."""
+    if IS_WINDOWS:
+        try:
+            import win_routing
+            win_routing.cleanup_stale(kill_tor=kill_tor)
+        except Exception:
+            pass
+
+
+def flush_dns() -> None:
+    """Windows: flush the OS DNS cache so a just-changed exit country takes effect
+    immediately (old lookups were resolved through the previous exit). No-op on Linux."""
+    if IS_WINDOWS:
+        try:
+            subprocess.run(["ipconfig", "/flushdns"], capture_output=True,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception:
+            pass
+
+
+def routing_mode():
+    """Active Windows routing mode: 'tun', 'proxy', or None. Always None on Linux."""
+    if IS_WINDOWS:
+        try:
+            import win_routing
+            return win_routing._state.get("mode")
+        except Exception:
+            return None
+    return None
+
+
+def open_secure_browser() -> tuple:
+    """Windows: open a browser window hard-wired to Tor (proxy + no-QUIC, isolated
+    profile) — the most reliable way to actually browse through Tor. No-op elsewhere."""
+    if IS_WINDOWS:
+        try:
+            import win_routing
+            return win_routing.open_secure_browser(HTTP_TUNNEL_PORT)
+        except Exception as exc:
+            return False, f"Could not open secure browser: {exc}"
+    return False, "Secure-browser launch is Windows-only."
+
+
 def disable_system_routing() -> tuple:
     if IS_WINDOWS:
         try:
             import win_routing
             return win_routing.disable()
         except Exception as exc:
-            return False, f"WinDivert restore error: {exc}"
+            return False, f"Windows routing restore error: {exc}"
 
     # ── Linux: unchanged ──
     try:
@@ -627,6 +950,12 @@ class TorManager:
         self._controller = None
         self._monitoring = False
         self._user_data_dir: Optional[str] = None
+
+    def tor_pid(self):
+        """PID of the running tor.exe (or None) — used to exclude Tor's own
+        traffic from Windows system-wide routing."""
+        p = self._process
+        return p.pid if (p and p.poll() is None) else None
 
     def start_tor(self) -> bool:
         if not os.path.isfile(TOR_EXE_PATH) and not shutil.which(TOR_EXE_PATH):
@@ -655,6 +984,8 @@ class TorManager:
         cmd = [TOR_EXE_PATH, "-f", TORRC_PATH,
                "--DataDirectory", self._user_data_dir,
                "--Log", "notice stdout"]
+        # Windows: pluggable transports + geoip databases via argv (Linux returns []).
+        cmd += _win_tor_extra_args()
 
         # Send Tor's combined output to a file (so a full pipe can never block
         # Tor, and we can read the real error on immediate exit).
@@ -772,22 +1103,32 @@ class TorManager:
             return -1
 
     def wait_for_bootstrap(self, timeout: float, on_progress=None,
-                           should_continue=None) -> bool:
+                           should_continue=None, stall_after=None) -> bool:
         """
         Poll bootstrap until 100% or timeout. If `should_continue` is given and
         returns False, abort early (used to cancel a connection in progress).
+
+        `stall_after` (seconds) is an optional early-out: if the bootstrap makes
+        no forward progress for that long, give up so the caller can try the next
+        connection mode instead of burning the whole timeout. Left as None (the
+        default) the behaviour is exactly as before — Linux passes nothing.
         """
         deadline = time.time() + timeout
         last = -1
+        last_change = time.time()
         while time.time() < deadline:
             if should_continue is not None and not should_continue():
                 return False
             pct = self.bootstrap_progress()
-            if pct != last and on_progress and pct >= 0:
-                on_progress(pct)
+            if pct != last and pct >= 0:
+                if on_progress:
+                    on_progress(pct)
                 last = pct
+                last_change = time.time()
             if pct >= 100:
                 return True
+            if stall_after is not None and time.time() - last_change > stall_after:
+                return False
             time.sleep(0.5)
         return self.bootstrap_progress() >= 100
 
@@ -800,6 +1141,42 @@ class TorManager:
         else:
             self._controller.reset_conf("ExitNodes")
             self._controller.reset_conf("StrictNodes")
+        # Circuits built before this point keep their OLD (random) exit, so traffic
+        # would still leave via the wrong country (e.g. show Netherlands when France
+        # was picked). Close them so Tor rebuilds every circuit through the new exit.
+        try:
+            for circ in self._controller.get_circuits():
+                try:
+                    self._controller.close_circuit(circ.id)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def exit_country_ok(self, country_code: str, timeout: float = 20.0) -> bool:
+        """Wait until at least one BUILT circuit actually exits in `country_code`
+        (e.g. '{fr}' → 'fr'). Lets the caller know the chosen country is usable."""
+        if not self._controller or not country_code:
+            return True
+        want = country_code.strip("{}").lower()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                for circ in self._controller.get_circuits():
+                    if circ.status.casefold() != "built" or not circ.path:
+                        continue
+                    fp = circ.path[-1][0]
+                    try:
+                        cc = self._controller.get_info(f"ip-to-country/"
+                                + self._controller.get_network_status(fp).address)
+                        if cc and cc.lower() == want:
+                            return True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            time.sleep(1.0)
+        return False
 
     def new_identity(self) -> None:
         if not self._controller:

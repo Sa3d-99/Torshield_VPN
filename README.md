@@ -4,12 +4,12 @@
   <img src="torshield.png" alt="TorShield Logo" width="180"/>
 </p>
 
-A GUI-based Tor VPN client for Linux that routes **all system traffic** through
-the Tor network — every app, every browser, every connection — with a single
-toggle switch. No per-app configuration required.
+A GUI-based Tor VPN client for **Linux and Windows** that routes **all system
+traffic** through the Tor network — every app, every browser, every connection —
+with a single click. No per-app configuration required.
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)
-![Platform](https://img.shields.io/badge/Platform-Linux-orange?logo=linux)
+![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows-orange)
 ![License](https://img.shields.io/badge/License-MIT-green)
 ![Tor](https://img.shields.io/badge/Powered%20by-Tor-purple?logo=tor-browser)
 
@@ -75,26 +75,49 @@ torshield-uninstall
 
 ## Windows
 
-TorShield also runs on Windows (the same Fluent GUI, Tor connection, bridges,
-circuits, exit-country, identity, IP test, and auto-update).
+TorShield runs on Windows too — the same Fluent GUI and a **full system-wide VPN**
+that routes **every app** through Tor (like the Linux build). **No Tor Browser
+required.**
 
 ```powershell
-# 1. Get Tor: download the Tor Expert Bundle from
-#    https://www.torproject.org/download/tor/  and put tor.exe
-#    (plus snowflake-client.exe / obfs4proxy.exe for bridges) in a "tor\" folder
-#    next to the project.
-# 2. Install Python deps + generate config + fetch bridges:
+# 1. Install the Python dependencies (one-time):
 python setup_windows.py
-# 3. Launch (right-click your terminal → "Run as administrator" for routing):
+
+# 2. Launch — accept the UAC (Administrator) prompt when it appears:
 python tor_vpn_gui.py
 ```
 
-**Differences from Linux:**
-- Elevation uses the **UAC prompt** (instead of pkexec/sudo).
-- Config lives in `%APPDATA%\TorShield\` (torrc, bridges, data).
-- "Route all traffic" uses **WinDivert** (`pydivert`) to transparently send all
-  TCP through Tor — this is the experimental Windows equivalent of Linux's
-  iptables routing and requires Administrator. Everything else is identical.
+**Tor itself is downloaded automatically** on first run (the official Tor Expert
+Bundle, ~22 MB, into `%APPDATA%\TorShield`) — you don't need Tor Browser or a
+manual `tor.exe`. Then just pick a country and click **Connect**.
+
+### How Windows routing works
+
+- **Full VPN — default, needs Administrator.** A **Wintun** virtual adapter +
+  **tun2socks** push *all* apps' traffic into Tor, with **DNS resolved through
+  Tor** (no DNS leak), **IPv6 leak protection**, and Tor's own relay traffic
+  routed *around* the tunnel so it never loops. The helper binaries
+  (`wintun.dll`, `tun2socks.exe`) download automatically on first connect. Accept
+  the UAC prompt when the app launches.
+- **Proxy fallback — no Administrator.** If you decline UAC, TorShield falls back
+  to the per-user Windows system proxy (HTTP) pointed at Tor. This covers browsers
+  and proxy-aware apps and **can never disconnect your machine**.
+
+### Windows notes
+
+- Elevation uses the **UAC prompt** (instead of pkexec/sudo); the console window
+  is hidden automatically (no black `cmd` window).
+- Config and Tor live in `%APPDATA%\TorShield\`.
+- **Exit country** really works: changing it rebuilds your circuits through that
+  country. A country with no Tor exit automatically falls back to the best
+  available exit so you stay online.
+- **Self-healing:** routing, DNS, and IPv6 are restored automatically on
+  disconnect / when you close the app, and any leftover state from a crash is
+  auto-repaired on the next launch. If your internet is ever stuck, run
+  **`reset_internet.bat`** (right-click → *Run as administrator*) to restore it
+  instantly.
+- After connecting, if a browser still shows your real location, fully close and
+  reopen it once (browsers cache DNS internally for ~1 minute).
 
 ---
 
@@ -215,15 +238,58 @@ traffic returns to normal.
 
 ## Building a Standalone Binary (Optional)
 
-A prebuilt binary is included in `dist/tor_vpn_gui`. To rebuild it yourself:
+The resulting exe **bundles every Python dependency** (PyQt5, stem, requests,
+pywin32, …) — the target PC needs **no Python and no pip**. Tor and the
+tun2socks/wintun helpers are **downloaded automatically on first run** into
+`%APPDATA%\TorShield`, so the exe stays small and self-contained.
+
+### Windows — Nuitka (recommended: faster + harder to reverse-engineer)
+
+Nuitka compiles the Python to native C, so the exe is faster and much harder to
+decompile than a PyInstaller bundle. One command:
+
+```powershell
+build_exe.bat
+# output: TorShield.exe  (single file, no console)
+```
+
+### Windows — PyInstaller (alternative)
+
+```powershell
+pip install pyinstaller
+pyinstaller TorShield.spec --distpath .
+# output: TorShield.exe  (in the project folder, ready for the installer)
+```
+
+Either way, just double-click the exe — it requests Administrator via UAC and
+sets itself up automatically. Nothing else to install.
+
+### Make it a real installed program (Start Menu + uninstaller)
+
+A ready-to-use **[Inno Setup](https://jrsoftware.org/isdl.php)** script
+(`TorShield.iss`) is included — it turns the exe into a proper Windows installer
+(Program Files install, Start-Menu + Desktop shortcuts, Add/Remove Programs entry,
+uninstaller that also restores routing).
+
+```powershell
+# 1. Build the exe:
+build_exe.bat
+# 2. Install Inno Setup, then compile the installer:
+iscc TorShield.iss
+# output: Output\TorShield-Setup-1.0.0.exe
+```
+
+Ship that one `TorShield-Setup-1.0.0.exe` — users run it, click through the wizard,
+and get TorShield in their Start Menu. **No Python, no dependencies to install** —
+everything is inside the exe, and Tor downloads itself on first launch.
+
+### Linux
 
 ```bash
 pip install pyinstaller
 pyinstaller --onefile --windowed tor_vpn_gui.py
-# output: dist/tor_vpn_gui
+# output: dist/tor_vpn_gui   (still needs Tor installed via apt)
 ```
-
-> The binary still requires Tor to be installed on the target system.
 
 ---
 
@@ -257,14 +323,20 @@ pyinstaller --onefile --windowed tor_vpn_gui.py
 
 ```
 torshield/
-├── tor_vpn_gui.py       # Main application — all logic and GUI in one file
-├── torrc.template       # Tor configuration template (copy to /etc/tor/torrc)
+├── tor_vpn_gui.py       # Main application — Fluent GUI (view layer)
+├── torshield_core.py    # Backend — Tor manager, bridges, detection, routing API
+├── win_routing.py       # Windows-only — TUN VPN (tun2socks) + system-proxy fallback
+├── setup_windows.py     # Windows one-time setup (installs Python deps)
+├── reset_internet.bat   # Windows emergency: restore internet if ever stuck
+├── build_exe.bat        # Windows — build TorShield.exe with Nuitka (one command)
+├── TorShield.spec       # Windows — PyInstaller spec (alternative build)
+├── TorShield.iss        # Windows — Inno Setup script → TorShield-Setup.exe installer
+├── torshield.ico        # Windows exe / installer icon
+├── torrc.template       # Tor configuration template (Linux: copy to /etc/tor/torrc)
 ├── requirements.txt     # Python dependencies
-├── install.sh           # One-shot installer (recommended)
-├── uninstall.sh         # Uninstaller
+├── install.sh           # Linux one-shot installer (recommended)
+├── uninstall.sh         # Linux uninstaller
 ├── torshield.png        # App icon — copied to ~/.local/share/icons/ by installer
-├── tor_vpn_gui.spec     # PyInstaller build spec
-├── dist/tor_vpn_gui     # Prebuilt standalone binary
 ├── INSTALL.md           # Detailed manual installation guide
 ├── CHANGELOG.md         # Version history
 ├── LICENSE              # MIT License

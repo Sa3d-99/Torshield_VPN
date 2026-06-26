@@ -54,13 +54,22 @@ def main():
         print(f"[!] Could not import torshield_core: {exc}")
         return
 
-    print("[2/4] Locating Tor…")
+    print("[2/4] Locating / installing Tor (no Tor Browser required)…")
     if os.path.isfile(core.TOR_EXE_PATH) or _which(core.TOR_EXE_PATH):
         print(f"      Found: {core.TOR_EXE_PATH}\n")
     else:
-        print("      tor.exe NOT found. Download the Tor Expert Bundle from")
-        print("      https://www.torproject.org/download/tor/ and put tor.exe")
-        print(f"      in:  {os.path.join(HERE, 'tor')}\\\n")
+        print("      tor.exe not found — downloading the official Tor Expert")
+        print("      Bundle (~22 MB). This is a one-time setup.")
+        try:
+            core.ensure_tor_installed(log=lambda m: print(f"      {m}"))
+        except Exception as exc:
+            print(f"      Tor download failed: {exc}")
+        if os.path.isfile(core.TOR_EXE_PATH):
+            print(f"      OK — Tor ready: {core.TOR_EXE_PATH}\n")
+        else:
+            print("      Could not install Tor automatically. As a fallback, put")
+            print("      tor.exe from https://www.torproject.org/download/tor/")
+            print(f"      in:  {os.path.join(HERE, 'tor')}\\\n")
 
     print("[3/4] Generating torrc…")
     try:

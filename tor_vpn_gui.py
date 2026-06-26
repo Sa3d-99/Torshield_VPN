@@ -17,6 +17,47 @@ import sys
 import threading
 
 
+def _windows_no_console() -> None:
+    """
+    Windows: make sure no black cmd window is ever shown. If we are running under
+    the console python.exe, re-launch the exact same script under pythonw.exe
+    (which is windowless) and exit, so the console disappears immediately. Under
+    pythonw there is no stdout/stderr, so point them at the null device to keep any
+    stray print() safe. Completely no-op on Linux.
+    """
+    if os.name != "nt":
+        return
+    if getattr(sys, "frozen", False) or "__compiled__" in globals():
+        return            # a built exe (PyInstaller/Nuitka, windowed) has no console
+    exe = sys.executable or ""
+    already_windowless = (exe.lower().endswith("pythonw.exe")
+                          or os.environ.get("TORSHIELD_PYW") == "1")
+    if already_windowless:
+        for _name in ("stdout", "stderr"):
+            if getattr(sys, _name, None) is None:
+                try:
+                    setattr(sys, _name, open(os.devnull, "w"))
+                except Exception:
+                    pass
+        return
+    pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+    if not os.path.isfile(pyw):
+        return                      # no pythonw — fall back to the normal console
+    try:
+        import subprocess
+        subprocess.Popen(
+            [pyw, os.path.abspath(__file__)] + sys.argv[1:],
+            env=dict(os.environ, TORSHIELD_PYW="1"),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            close_fds=True)
+    except Exception:
+        return                      # couldn't relaunch — keep running as-is
+    sys.exit(0)
+
+
+_windows_no_console()
+
+
 def _add_invoking_user_site_packages() -> None:
     """
     The app runs as ROOT (via pkexec/sudo), but its pip dependencies
@@ -207,6 +248,13 @@ class TorShieldWindow(QWidget):
         self._connect_secs = 0
         self._cancel = threading.Event()   # set to abort an in-progress connect
 
+        # Safety net: restore routing/DNS on ANY interpreter exit (unhandled
+        # exception, normal quit) — not just the window-close handler — so the user
+        # is never left offline. Combined with the startup auto-repair, the only
+        # way to stay stuck is a hard kill, which `reset_internet.bat` undoes.
+        import atexit
+        atexit.register(self._emergency_restore)
+
         self.setWindowTitle(f"TorShield · System-Wide Tor VPN  v{core.__version__}")
         self.resize(1120, 780)
         self.setMinimumSize(720, 560)
@@ -221,18 +269,24 @@ class TorShieldWindow(QWidget):
 
         self._log_environment()
 
-        # Background: check GitHub for updates, then prefetch bridges.
+        # Background: check GitHub for updates; make sure Tor itself is present
+        # (Windows downloads the Tor Expert Bundle on first run, so the user does
+        # NOT need Tor Browser), then prefetch bridges.
         threading.Thread(target=self._check_updates, daemon=True).start()
-        if core.OBFS4PROXY:
-            threading.Thread(target=self._prefetch_bridges, daemon=True).start()
+        threading.Thread(target=self._startup_tor_and_bridges, daemon=True).start()
 
     # ── Icon ──────────────────────────────────────────────────────────────────
     def _logo_path(self):
-        here = os.path.dirname(os.path.abspath(__file__))
-        for n in ("Header_Logo.png", "torshield.png"):
-            p = os.path.join(here, n)
-            if os.path.isfile(p):
-                return p
+        # Look in the PyInstaller bundle dir first (frozen exe), then the source dir.
+        bases = []
+        if getattr(sys, "frozen", False):
+            bases.append(getattr(sys, "_MEIPASS", ""))
+        bases.append(os.path.dirname(os.path.abspath(__file__)))
+        for here in bases:
+            for n in ("Header_Logo.png", "torshield.png"):
+                p = os.path.join(here, n)
+                if here and os.path.isfile(p):
+                    return p
         return None
 
     def _load_window_icon(self):
@@ -645,7 +699,9 @@ class TorShieldWindow(QWidget):
 
     # ── Environment / bridges / updates ──────────────────────────────────────────
     def _log_environment(self):
-        if core.check_root():
+        if core.IS_WINDOWS:
+            self.log("Ready — routing via per-user system proxy (no admin needed).", "ok")
+        elif core.check_root():
             self.log("Running as root — system-wide routing available.", "ok")
         else:
             self.log("Not root — routing unavailable. Launch via 'torshield'.", "warn")
@@ -655,6 +711,30 @@ class TorShieldWindow(QWidget):
         self.log(f"obfs4proxy : {core.OBFS4PROXY or 'not installed'}",
                  "dim" if core.OBFS4PROXY else "warn")
         self.log(f"Version    : {core.__version__}", "dim")
+
+    def _startup_tor_and_bridges(self):
+        # Quietly repair any leftover TUN/DNS state from a previous crashed or
+        # force-closed run, so the machine self-heals on launch (no manual reset).
+        if core.IS_WINDOWS:
+            try:
+                core.cleanup_stale_routing()
+            except Exception:
+                pass
+        # On Windows, fetch Tor itself if it isn't already available, so the app is
+        # self-contained and does not require Tor Browser to be installed.
+        try:
+            if core.IS_WINDOWS and not os.path.isfile(core.TOR_EXE_PATH):
+                self.log("Tor not found — downloading the official Tor Expert "
+                         "Bundle now (no Tor Browser needed, one-time ~22 MB)…",
+                         "accent")
+                core.ensure_tor_installed(log=lambda m: self.log(m, "dim"))
+                self.log(f"Tor binary : {core.TOR_EXE_PATH}",
+                         "ok" if os.path.isfile(core.TOR_EXE_PATH) else "warn")
+                self.log(f"Transports : {core.OBFS4PROXY or 'not installed'}",
+                         "dim" if core.OBFS4PROXY else "warn")
+        except Exception as exc:
+            self.log(f"Tor auto-install problem: {exc}", "warn")
+        self._prefetch_bridges()
 
     def _prefetch_bridges(self):
         try:
@@ -733,10 +813,18 @@ class TorShieldWindow(QWidget):
     # ── Connection flow (auto: Direct → Snowflake → obfs4) ──────────────────────
     def _mode_sequence(self):
         seq = ["Direct"]
-        if core.SNOWFLAKE_CLIENT:
-            seq.append("Snowflake")
-        if core.OBFS4PROXY:
-            seq.append("obfs4")
+        if core.IS_WINDOWS:
+            # obfs4 is faster and more reliable than snowflake, so try it first on
+            # Windows. Linux keeps the original Snowflake → obfs4 order below.
+            if core.OBFS4PROXY:
+                seq.append("obfs4")
+            if core.SNOWFLAKE_CLIENT:
+                seq.append("Snowflake")
+        else:
+            if core.SNOWFLAKE_CLIENT:
+                seq.append("Snowflake")
+            if core.OBFS4PROXY:
+                seq.append("obfs4")
         return seq
 
     def _attempt_mode(self, mode, timeout):
@@ -751,7 +839,9 @@ class TorShieldWindow(QWidget):
             if not core.load_obfs4_bridges():
                 self.log("obfs4 unavailable (could not fetch bridges).", "warn")
                 return False
-        if core.check_root():
+        # Windows torrc lives in the user's AppData (always writable); Linux's is
+        # /etc/tor/torrc which needs root. Apply the bridge mode whenever we can.
+        if core.IS_WINDOWS or core.check_root():
             try:
                 core.apply_bridge_mode(mode)
             except Exception as exc:
@@ -776,7 +866,12 @@ class TorShieldWindow(QWidget):
         ok = self._tor.wait_for_bootstrap(
             timeout=timeout,
             on_progress=lambda p: self.sig_progress.emit(p, f"{mode}: bootstrapping… {p}%"),
-            should_continue=lambda: not self._cancel.is_set())
+            should_continue=lambda: not self._cancel.is_set(),
+            # Windows: bail out of a stuck mode after 75s of no progress so we move
+            # on to a working one quickly (the slow descriptor gaps on a throttled
+            # link can be ~60s, so 75s avoids false stalls). Linux passes nothing
+            # and keeps its original fixed-timeout behaviour.
+            stall_after=(75.0 if core.IS_WINDOWS else None))
         if self._cancel.is_set():
             return False
         self.log(f"{mode}: {'bootstrapped' if ok else 'stalled'}.",
@@ -788,7 +883,14 @@ class TorShieldWindow(QWidget):
         self.sig_status.emit("connecting")
         seq = self._mode_sequence()
         self.log(f"Connecting (plan: {' → '.join(seq)})", "info")
-        timeouts = {"Direct": 25.0, "Snowflake": 75.0, "obfs4": 60.0}
+        if core.IS_WINDOWS:
+            # Windows starts from a cold tor-data on first connect, so the very
+            # first bootstrap must download the whole consensus + microdescriptors
+            # and can take 1–2 minutes. Linux usually reuses a warm system Tor
+            # cache and stays on the original, tighter timeouts.
+            timeouts = {"Direct": 90.0, "Snowflake": 120.0, "obfs4": 120.0}
+        else:
+            timeouts = {"Direct": 25.0, "Snowflake": 75.0, "obfs4": 60.0}
 
         def _w():
             connected = None
@@ -812,18 +914,43 @@ class TorShieldWindow(QWidget):
                                    "Tor could not connect in any mode.", "error")
                 return
             try:
+                # Pin the exit country if requested — but never let a failure here
+                # stop us from showing circuits / marking the session connected.
                 cc = core.COUNTRY_CODES.get(self._country.currentText(), "")
                 if cc:
-                    self._tor.set_exit_node(cc)
-                    self.log(f"Exit node set to: {self._country.currentText()}", "ok")
+                    try:
+                        self._tor.set_exit_node(cc)
+                        self.log(f"Pinning exit to {self._country.currentText()} — "
+                                 "rebuilding circuits…", "accent")
+                        if self._tor.exit_country_ok(cc, timeout=25):
+                            self.log(f"Exit node set to: {self._country.currentText()}",
+                                     "ok")
+                        else:
+                            # Country has no usable Tor exit right now — fall back to
+                            # any exit so the user actually gets internet.
+                            self.log(f"{self._country.currentText()} has no available "
+                                     "Tor exit right now — using the best available "
+                                     "exit so you stay online.", "warn")
+                            self._tor.set_exit_node("")
+                    except Exception as exc:
+                        self.log(f"Could not pin exit to "
+                                 f"{self._country.currentText()}: {exc}", "warn")
+                # Start circuit monitoring and mark connected BEFORE routing, so the
+                # circuits panel populates even if routing has trouble.
                 self._tor.start_circuit_monitoring(
                     callback=lambda c: self.sig_circuits.emit(c), interval=5.0)
                 self.sig_status.emit("connected")
                 self.log(f"Connected via {connected}!", "ok")
                 self.sig_info.emit("Connected", f"Tor is up via {connected}.", "ok")
-                # AUTOMATIC system-wide routing (no switch) — shown step by step.
-                if core.check_root():
-                    self._auto_route()
+                # AUTOMATIC routing (no switch) — shown step by step. On Windows
+                # this is a per-user system-proxy setting that needs no admin; on
+                # Linux it still requires root for iptables.
+                if core.IS_WINDOWS or core.check_root():
+                    try:
+                        self._auto_route()
+                    except Exception as exc:
+                        self.log(f"Routing error (Tor is still connected): {exc}",
+                                 "warn")
                 else:
                     self.log("Not root — cannot route system traffic.", "warn")
             except Exception as exc:
@@ -832,22 +959,40 @@ class TorShieldWindow(QWidget):
         threading.Thread(target=_w, daemon=True).start()
 
     def _auto_route(self):
-        self.log("Routing ALL system traffic through Tor…", "accent")
+        self.log("Routing traffic through Tor…", "accent")
         if core.IS_WINDOWS:
-            self.log("  • loading WinDivert kernel driver", "dim")
-            self.log("  • redirecting outbound TCP → Tor SOCKS", "dim")
-            self.log("  • DNS resolved through Tor (socks5h)", "dim")
+            self.log("  • bringing up TUN VPN adapter (all apps → Tor)", "dim")
+            self.log("  • routing Tor's own relays around the tunnel", "dim")
+            self.log("  • DNS resolved through Tor", "dim")
         else:
             self.log("  • flushing conntrack (prevents pre-Tor leaks)", "dim")
             self.log("  • redirecting TCP → Tor TransPort 9040", "dim")
             self.log("  • redirecting DNS → Tor DNSPort 5353", "dim")
             self.log("  • blocking QUIC (UDP 443/80)", "dim")
-        ok, msg = core.enable_system_routing()
+        ok, msg = core.enable_system_routing(
+            tor_pid=core.IS_WINDOWS and self._tor.tor_pid() or None,
+            log=lambda m: self.log(m, "dim"))
         self._routing_active = ok
         self.log(msg, "ok" if ok else "error")
         if ok:
-            self.log("Every app on this machine now uses Tor.", "ok")
-            self.sig_info.emit("Routing active", "All traffic now goes through Tor.", "ok")
+            mode = core.routing_mode()
+            if mode == "tun":
+                self.log("Every app on this machine now goes through Tor.", "ok")
+                self.sig_info.emit("VPN active", "All apps now route through Tor.", "ok")
+            elif mode == "proxy":
+                # Fallback path (not elevated / TUN unavailable): the proxy only
+                # covers proxy-aware apps, so restart the browser through Tor too.
+                self.log("Full-VPN unavailable — using proxy mode. Restarting your "
+                         "browser through Tor…", "warn")
+                bok, bmsg = core.open_secure_browser()
+                self.log(bmsg, "ok" if bok else "warn")
+                self.sig_info.emit("Routing active (proxy mode)",
+                                   "Browser routes through Tor. Run as admin for "
+                                   "all-apps VPN.", "ok")
+            else:
+                self.log("Every app on this machine now uses Tor.", "ok")
+                self.sig_info.emit("Routing active",
+                                   "All traffic now goes through Tor.", "ok")
 
     def _on_disconnect(self):
         cancelling = self._status == "connecting"
@@ -861,18 +1006,29 @@ class TorShieldWindow(QWidget):
             threading.Thread(target=self._tor.stop_tor, daemon=True).start()
             return
 
-        if self._routing_active:
-            self.log("Restoring direct routing…")
-            ok, msg = core.disable_system_routing()
-            self._routing_active = False
-            self.log(msg, "ok" if ok else "error")
         self.log("Disconnecting…")
         self._tor.stop_circuit_monitoring()
+        was_routing = self._routing_active
+        self._routing_active = False
+        self._disconnect_btn.setEnabled(False)   # prevent double-clicks during teardown
+        # Everything below (restore routing, remove the TUN adapter, stop Tor) can
+        # take a few seconds, so run it OFF the GUI thread — otherwise the window
+        # goes "Not responding" until it finishes.
         def _w():
+            if was_routing:
+                self.log("Restoring direct routing…")
+                ok, msg = core.disable_system_routing()
+                self.log(msg, "ok" if ok else "error")
             self._tor.stop_tor()
+            # Windows: full reset AFTER disconnect — remove the TUN adapter, clear any
+            # pinned DNS, re-enable IPv6 and flush the DNS cache — so the internet is
+            # always clean once disconnected (no manual reset, no leftover state).
+            if core.IS_WINDOWS:
+                self.log("Cleaning up network + flushing DNS…", "dim")
+                core.cleanup_stale_routing()
             self.sig_status.emit("disconnected")
             self.sig_circuits.emit([])
-            self.log("Tor stopped. All circuits closed.", "ok")
+            self.log("Tor stopped. Internet restored.", "ok")
         threading.Thread(target=_w, daemon=True).start()
 
     def _on_country_change(self, selection):
@@ -883,9 +1039,15 @@ class TorShieldWindow(QWidget):
         def _w():
             try:
                 self._tor.set_exit_node(cc)
-                self.log(f"Exit node changed to: {selection}" if cc
-                         else "Exit node restriction removed (Random).", "ok")
-                self._tor.new_identity()
+                if not cc:
+                    self.log("Exit node restriction removed (Random).", "ok")
+                elif self._tor.exit_country_ok(cc, timeout=25):
+                    self.log(f"Exit node changed to: {selection}", "ok")
+                else:
+                    self.log(f"{selection} has no available Tor exit right now — "
+                             "using the best available exit.", "warn")
+                    self._tor.set_exit_node("")
+                core.flush_dns()   # drop lookups cached via the old exit country
             except Exception as exc:
                 self.log(f"Failed to change exit node: {exc}", "error")
         threading.Thread(target=_w, daemon=True).start()
@@ -916,6 +1078,20 @@ class TorShieldWindow(QWidget):
                 if self._status == "connected":
                     self._test_btn.setEnabled(True)
         threading.Thread(target=_w, daemon=True).start()
+
+    def _emergency_restore(self):
+        """Last-resort cleanup on interpreter exit — restore routing/DNS and stop
+        Tor so the user is never left offline. Safe to call more than once."""
+        try:
+            if getattr(self, "_routing_active", False):
+                core.disable_system_routing()
+                self._routing_active = False
+        except Exception:
+            pass
+        try:
+            self._tor.stop_tor()
+        except Exception:
+            pass
 
     def closeEvent(self, event):
         if self._status in ("connected", "connecting"):

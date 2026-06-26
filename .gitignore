@@ -16,12 +16,19 @@ venv/
 env/
 ENV/
 
-# ── PyInstaller build output ──────────────────────────────────────────────────
-# The compiled binary is intentionally excluded — users build it themselves
-# using the instructions in INSTALL.md
+# ── Build output (binaries built locally, never commit) ──────────────────────
+# The compiled exe/installer are built by users; only the build scripts are tracked.
 dist/
 build/
+Output/
 *.spec
+!TorShield.spec      # keep the committed Windows build spec
+TorShield.exe
+TorShield-Setup*.exe
+# Nuitka intermediates
+*.build/
+*.dist/
+*.onefile-build/
 
 # ── IDE / Editor ──────────────────────────────────────────────────────────────
 .vscode/
@@ -49,4 +56,19 @@ tor.pid
 # Users create their own from the template in docs/
 torrc
 torrc.local
+torshield.conf
 graphify-out/
+.claude/
+
+# ── Windows runtime (downloaded / generated locally, never commit) ────────────
+# Tor + helper binaries are fetched into %APPDATA%\TorShield at runtime; ignore
+# these in case anyone bundles them next to the project.
+tor/
+tun2socks/
+*.exe
+*.dll
+wintun*.zip
+tun2socks*.zip
+tun_diag_output.txt
+*.tmp
+*.bak
